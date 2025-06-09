@@ -12,7 +12,17 @@ import mp4box, {
 import { DEFAULT_AUDIO_CONF } from '../clips';
 import { file } from 'opfs-tools';
 
+/**
+ * Extracts the necessary configuration objects for WebCodecs decoders
+ * from a parsed MP4 file. This function translates the MP4 metadata
+ * into a format that VideoDecoder and AudioDecoder can understand.
+ *
+ * @param file - The parsed MP4File object from mp4box.js.
+ * @param info - The info object provided by mp4box.js's onReady callback.
+ * @returns An object containing track and decoder configurations for video and audio.
+ */
 export function extractFileConfig(file: MP4File, info: MP4Info) {
+  // Get the first video track from the MP4 info.
   const vTrack = info.videoTracks[0];
   const rs: {
     videoTrackConf?: VideoTrackOpts;
@@ -20,14 +30,23 @@ export function extractFileConfig(file: MP4File, info: MP4Info) {
     audioTrackConf?: AudioTrackOpts;
     audioDecoderConf?: Parameters<AudioDecoder['configure']>[0];
   } = {};
+
+  // If a video track exists, process it.
   if (vTrack != null) {
+    // The 'description' for the VideoDecoder is a binary blob (avcC, hvcC, etc.)
+    // that contains essential initialization parameters for the codec.
     const videoDesc = parseVideoCodecDesc(file.getTrackById(vTrack.id)).buffer;
-    const { descKey, type } = vTrack.codec.startsWith('avc1')
+
+    // Determine the key for the decoder configuration record based on the codec string.
+    const { descKey, type } = vTrack.codec.startsWith('avc1') // H.264/AVC
       ? { descKey: 'avcDecoderConfigRecord', type: 'avc1' }
-      : vTrack.codec.startsWith('hvc1')
+      : vTrack.codec.startsWith('hvc1') // H.265/HEVC
         ? { descKey: 'hevcDecoderConfigRecord', type: 'hvc1' }
-        : { descKey: '', type: '' };
+        : { descKey: '', type: '' }; // Other codecs might not need this.
+
+    // If we identified a known codec type, create the configuration for it.
     if (descKey !== '') {
+      // This configuration is useful if you need to remux the MP4 file.
       rs.videoTrackConf = {
         timescale: vTrack.timescale,
         duration: vTrack.duration,
@@ -35,45 +54,65 @@ export function extractFileConfig(file: MP4File, info: MP4Info) {
         height: vTrack.video.height,
         brands: info.brands,
         type,
+        // Dynamically set the key for the decoder config record.
         [descKey]: videoDesc,
       };
     }
 
+    // This is the configuration object required by the WebCodecs VideoDecoder.
     rs.videoDecoderConf = {
       codec: vTrack.codec,
       codedHeight: vTrack.video.height,
       codedWidth: vTrack.video.width,
-      description: videoDesc,
+      description: videoDesc, // The critical binary blob for decoder initialization.
     };
   }
 
+  // Get the first audio track from the MP4 info.
   const aTrack = info.audioTracks[0];
   if (aTrack != null) {
+    // The 'esds' box contains detailed configuration for AAC audio.
     const esdsBox = getESDSBoxFromMP4File(file);
+
+    // This configuration is for remuxing purposes.
     rs.audioTrackConf = {
       timescale: aTrack.timescale,
       samplerate: aTrack.audio.sample_rate,
       channel_count: aTrack.audio.channel_count,
-      hdlr: 'soun',
+      hdlr: 'soun', // Handler type for sound tracks.
       type: aTrack.codec.startsWith('mp4a') ? 'mp4a' : aTrack.codec,
       description: getESDSBoxFromMP4File(file),
     };
+
+    // This is the configuration object for the WebCodecs AudioDecoder.
     rs.audioDecoderConf = {
+      // Sometimes the codec string is 'mp4a.40.2'; we standardize it for wider compatibility.
       codec: aTrack.codec.startsWith('mp4a')
-        ? DEFAULT_AUDIO_CONF.codec
+        ? DEFAULT_AUDIO_CONF.codec // e.g., 'mp4a.40.2'
         : aTrack.codec,
       numberOfChannels: aTrack.audio.channel_count,
       sampleRate: aTrack.audio.sample_rate,
+      // If the 'esds' box is present, parse it to get the most accurate
+      // audio info, as it can correct errors in the higher-level metadata.
       ...(esdsBox == null ? {} : parseAudioInfo4ESDSBox(esdsBox)),
     };
   }
   return rs;
 }
 
-// track is H.264, H.265 or VPX.
+/**
+ * A helper function to parse the video codec's specific description box
+ * (e.g., avcC for H.264, hvcC for H.265) from a track.
+ * This binary data is essential for initializing the video decoder.
+ *
+ * @param track - The track object from mp4box.js.
+ * @returns A Uint8Array containing the raw codec description data.
+ */
 function parseVideoCodecDesc(track: TrakBoxParser): Uint8Array {
+  // The description box is located inside the sample description ('stsd') box.
   for (const entry of track.mdia.minf.stbl.stsd.entries) {
-    // @ts-expect-error
+    // The box can have different names depending on the codec (avcC, hvcC, etc.).
+    // @ts-expect-error - Accessing non-standard properties on a union type.
     const box = entry.avcC ?? entry.hvcC ?? entry.av1C ?? entry.vpcC;
     if (box != null) {
       const stream = new mp4box.DataStream(
@@ -81,14 +120,25 @@ function parseVideoCodecDesc(track: TrakBoxParser): Uint8Array {
         0,
         mp4box.DataStream.BIG_ENDIAN,
       );
+      // Write the box's contents to a new stream to serialize it.
       box.write(stream);
-      return new Uint8Array(stream.buffer.slice(8)); // Remove the box header.
+      // Return the buffer, slicing off the first 8 bytes (the box header: size and type).
+      return new Uint8Array(stream.buffer.slice(8));
     }
   }
-  throw Error('avcC, hvcC, av1C or VPX not found');
+  throw Error('Codec description box (avcC, hvcC, av1C, or vpcC) not found');
 }
 
+/**
+ * A helper function to find the 'esds' (Elementary Stream Descriptor) box,
+ * which contains detailed configuration for AAC audio.
+ *
+ * @param file - The parsed MP4File object.
+ * @param codec - The codec type to look for, typically 'mp4a'.
+ * @returns The 'esds' box parser object, or undefined if not found.
+ */
 function getESDSBoxFromMP4File(file: MP4File, codec = 'mp4a') {
+  // Navigate through the MP4 structure to find the 'esds' box within an 'mp4a' entry.
   const mp4aBox = file.moov?.traks
     .map((t) => t.mdia.minf.stbl.stsd.entries)
     .flat()
@@ -97,20 +147,32 @@ function getESDSBoxFromMP4File(file: MP4File, codec = 'mp4a') {
   return mp4aBox?.esds;
 }
 
-// 解决封装层音频信息标识错误，导致解码异常
+/**
+ * Manually parses the 'esds' box to extract the true sample rate and channel count.
+ * This is a workaround for mislabeled MP4 files where the top-level metadata is incorrect,
+ * which would otherwise cause decoding to fail.
+ *
+ * @param esds - The 'esds' box parser object.
+ * @returns An object with the correct sampleRate and numberOfChannels.
+ */
 function parseAudioInfo4ESDSBox(esds: ESDSBoxParser) {
   const decoderConf = esds.esd.descs[0]?.descs[0];
   if (decoderConf == null) return {};
 
   const [byte1, byte2] = decoderConf.data;
-  // sampleRate 是第一字节后 3bit + 第二字节前 1bit
+  // The sample rate index is encoded across two bytes.
+  // It's the last 3 bits of the first byte and the first bit of the second byte.
   const sampleRateIdx = ((byte1 & 0x07) << 1) + (byte2 >> 7);
-  // numberOfChannels 是第二字节 [2, 5] 4bit
+  // The channel count is the next 4 bits in the second byte.
   const numberOfChannels = (byte2 & 0x7f) >> 3;
+
+  // The AAC specification defines a standard table for sample rates.
   const sampleRateEnum = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025,
     8000, 7350,
   ] as const;
+
+  // Return the parsed values, which will override the top-level metadata.
   return {
     sampleRate: sampleRateEnum[sampleRateIdx],
     numberOfChannels,
@@ -118,7 +180,13 @@ function parseAudioInfo4ESDSBox(esds: ESDSBoxParser) {
 }
 
 /**
- * 快速解析 mp4 文件，如果是非 fMP4 格式，会优先解析 moov box（略过 mdat）避免占用过多内存
+ * A fast, memory-efficient function to parse an MP4 file from a reader.
+ * It reads the file in chunks, prioritizing the 'moov' atom (metadata)
+ * and avoiding loading the entire 'mdat' atom (media data) into memory.
+ *
+ * @param reader - An OPFS file reader instance.
+ * @param onReady - A callback that fires once the 'moov' atom is parsed and file info is available.
+ * @param onSamples - A callback that fires as the sample index is parsed, providing chunks of samples.
  */
 export async function quickParseMP4File(
   reader: Awaited<ReturnType<ReturnType<typeof file>['createReader']>>,
@@ -129,9 +197,16 @@ export async function quickParseMP4File(
     samples: MP4Sample[],
   ) => void,
 ) {
+  // Create a new mp4box file parser instance.
   const mp4boxFile = mp4box.createFile(false);
+
+  // Set up the callback for when the file's metadata ('moov' box) is ready.
   mp4boxFile.onReady = (info) => {
+    // Fire the user-provided onReady callback with the file info.
     onReady({ mp4boxFile, info });
+
+    // After metadata is ready, tell mp4box to start extracting sample information.
+    // This doesn't extract the actual data, just the metadata about each sample.
     const vTrackId = info.videoTracks[0]?.id;
     if (vTrackId != null)
       mp4boxFile.setExtractionOptions(vTrackId, 'video', { nbSamples: 100 });
@@ -140,26 +215,47 @@ export async function quickParseMP4File(
     if (aTrackId != null)
       mp4boxFile.setExtractionOptions(aTrackId, 'audio', { nbSamples: 100 });
 
+    // Start the extraction process.
     mp4boxFile.start();
   };
+
+  // Set up the callback for when sample information has been extracted.
   mp4boxFile.onSamples = onSamples;
 
+  // Start the chunked parsing process.
   await parse();
 
+  // This inner function performs the actual chunked reading and parsing loop.
   async function parse() {
-    let cursor = 0;
-    const maxReadSize = 30 * 1024 * 1024;
+    let cursor = 0; // The current position in the file.
+    const maxReadSize = 30 * 1024 * 1024; // Read in 30 MB chunks.
+
     while (true) {
+      // Read a chunk of data from the file at the current cursor position.
       const data = (await reader.read(maxReadSize, {
         at: cursor,
       })) as MP4ArrayBuffer;
+
+      // If we've reached the end of the file, break the loop.
       if (data.byteLength === 0) break;
+
+      // Tell mp4box where this chunk is located in the original file.
+      // This is crucial for calculating the correct absolute byte offsets.
       data.fileStart = cursor;
+
+      // Feed the chunk to the parser. mp4box processes it and returns the
+      // position in the file where the next read should start.
       const nextPos = mp4boxFile.appendBuffer(data);
+
+      // If nextPos is null, it means mp4box has found all the necessary
+      // metadata ('moov') and doesn't need any more data. We can stop reading.
       if (nextPos == null) break;
+
+      // Otherwise, update the cursor to the new position for the next loop iteration.
       cursor = nextPos;
     }
 
+    // Inform mp4box that we have reached the end of the file stream.
     mp4boxFile.stop();
   }
 }

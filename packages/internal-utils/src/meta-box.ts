@@ -1,124 +1,303 @@
+/**
+ * Creates the 8-byte header for an MP4 box.
+ * The header consists of the box size and the box type.
+ *
+ * @param {string} type - The 4-character code for the box type (e.g., 'ftyp', 'moov').
+ * @param {number} size - The total size of the box in bytes, including the header itself.
+ * @returns {Uint8Array} A Uint8Array containing the box header.
+ */
 const createBoxHeader = (type: string, size: number): Uint8Array => {
-  const buffer = new Uint8Array(8);
-  const view = new DataView(buffer.buffer);
-  view.setUint32(0, size); // Write size as a 32-bit unsigned integer
+  // Allocate 8 bytes for the header.
+  const headerBuffer = new Uint8Array(8);
+  const dataView = new DataView(headerBuffer.buffer);
+  // First 4 bytes: size of the box (Big Endian).
+  dataView.setUint32(0, size);
+  // Next 4 bytes: type of the box (ASCII characters).
   for (let i = 0; i < 4; i++) {
-    buffer[4 + i] = type.charCodeAt(i); // Write type as a 4-character string
+    headerBuffer[4 + i] = type.charCodeAt(i);
   }
-  return buffer;
+  return headerBuffer;
 };
 
+/**
+ * Creates an 'hdlr' (Handler Reference) box.
+ * The 'hdlr' box within a 'meta' box declares the media type of the metadata.
+ * For iTunes metadata, this is typically 'mdta' for metadata handler.
+ *
+ * @returns {Uint8Array} A Uint8Array representing the 'hdlr' box.
+ */
 const createHdlrBox = (): Uint8Array => {
-  const tec = new TextEncoder();
-  const handlerType = tec.encode('mdta');
-  const nameBytes = tec.encode('mp4 handler');
-  // header8 + ?8 + mdta4 + ?12 + nameSize + endFlag1
-  const size = 8 + 8 + 4 + 12 + nameBytes.byteLength + 1;
-  const buffer = new Uint8Array(size);
-  const view = new DataView(buffer.buffer);
+  const textEncoder = new TextEncoder();
+  // Handler type: 'mdta' for metadata handler, specific to some metadata formats like iTunes.
+  const handlerTypeBytes = textEncoder.encode('mdta');
+  // Handler name: A human-readable name for the handler type, null-terminated.
+  const handlerNameBytes = textEncoder.encode('mp4 handler'); // Example name
 
-  // Box header
-  buffer.set(createBoxHeader('hdlr', size), 0);
+  // Calculate the total size of the 'hdlr' box.
+  // BoxHeader (8) + FullBoxVersionFlags (4) + Predefined (4 bytes, often 0) + HandlerType (4) + Reserved (3 * 4 bytes) + Name (variable + null terminator)
+  const size =
+    8 + // Basic box header (size + type)
+    4 + // Version (1 byte) & Flags (3 bytes)
+    4 + // Predefined (usually 0)
+    handlerTypeBytes.byteLength + // Handler type (e.g., 'mdta')
+    12 + // Reserved (3 * 4 bytes of 0)
+    handlerNameBytes.byteLength + // Name string
+    1; // Null terminator for the name string
 
-  // Full box header (version and flags)
-  view.setUint32(8, 0);
+  const hdlrBoxBuffer = new Uint8Array(size);
+  const dataView = new DataView(hdlrBoxBuffer.buffer);
 
-  buffer.set(handlerType, 16);
-  buffer.set(nameBytes, 32);
+  // Set the standard box header ('hdlr' and total size).
+  hdlrBoxBuffer.set(createBoxHeader('hdlr', size), 0);
 
-  return buffer;
+  // FullBox fields: version (0) and flags (0).
+  // Offset 8 (after basic box header).
+  dataView.setUint8(8, 0); // Version = 0
+  dataView.setUint32(8, 0); // Version (1 byte) + Flags (3 bytes) = 0
+
+  // Predefined field, typically zero.
+  // Offset 12 (after FullBox version/flags).
+  dataView.setUint32(12, 0);
+
+  // Handler type (e.g., 'mdta').
+  // Offset 16 (after Predefined).
+  hdlrBoxBuffer.set(handlerTypeBytes, 16);
+
+  // Reserved fields (12 bytes of zeros).
+  // Offset 20 (after HandlerType). (Filled by Uint8Array default)
+
+  // Handler name (UTF-8 string, null-terminated).
+  // Offset 32 (after Reserved fields).
+  hdlrBoxBuffer.set(handlerNameBytes, 32);
+  // The final byte is already 0 due to Uint8Array initialization (null terminator).
+  // dataView.setUint8(32 + handlerNameBytes.byteLength, 0); // Explicit null terminator
+
+  return hdlrBoxBuffer;
 };
 
+/**
+ * Creates a 'keys' box for iTunes-style metadata.
+ * The 'keys' box lists the metadata keys (tag names) that are used in the 'ilst' box.
+ * Each key has a namespace (typically 'mdta') and the key name itself.
+ *
+ * @param {string[]} keys - An array of strings, where each string is a metadata key name (e.g., "©alb", "©art").
+ * @returns {Uint8Array} A Uint8Array representing the 'keys' box.
+ */
 const createKeysBox = (keys: string[]): Uint8Array => {
-  const tec = new TextEncoder();
-  const keyNamespace = tec.encode('mdta');
-  const keyData = keys.map((key) => {
-    const keyBuf = tec.encode(key);
-    // size4 + namespace4 + keyBuf
-    const size = 4 + 4 + keyBuf.byteLength;
+  const textEncoder = new TextEncoder();
+  // Namespace for iTunes metadata keys, typically 'mdta'.
+  const keyNamespaceBytes = textEncoder.encode('mdta');
 
-    const entryBuf = new Uint8Array(size);
-    const dv = new DataView(entryBuf.buffer);
-    dv.setUint32(0, size);
-    entryBuf.set(keyNamespace, 4);
-    entryBuf.set(keyBuf, 4 + keyNamespace.byteLength);
+  // Encode each key into its entry format.
+  const encodedKeyEntries = keys.map((key) => {
+    const encodedKeyName = textEncoder.encode(key);
+    // Each key entry structure: entry_size (4 bytes) + key_namespace (4 bytes) + key_value (variable length)
+    const keyEntrySize =
+      4 + // Size of this key entry
+      keyNamespaceBytes.byteLength + // "mdta"
+      encodedKeyName.byteLength; // The actual key string
 
-    return entryBuf;
-  });
-  const keyDataSize = keyData.reduce((acc, cur) => acc + cur.byteLength, 0);
+    const keyEntryBuffer = new Uint8Array(keyEntrySize);
+    const dataView = new DataView(keyEntryBuffer.buffer);
 
-  const size = 16 + keyDataSize; // 16 bytes for the header and version/flags
-  const buffer = new Uint8Array(size);
-  const view = new DataView(buffer.buffer);
+    // Set the size of this individual key entry.
+    dataView.setUint32(0, keyEntrySize);
+    // Set the key namespace (e.g., 'mdta').
+    keyEntryBuffer.set(keyNamespaceBytes, 4);
+    // Set the key name itself.
+    keyEntryBuffer.set(encodedKeyName, 4 + keyNamespaceBytes.byteLength);
 
-  // Box header
-  buffer.set(createBoxHeader('keys', size), 0);
-
-  // Full box header (version and flags)
-  view.setUint32(8, 0);
-  view.setUint32(12, keys.length); // Entry count
-
-  // Keys
-  let offset = 16;
-  for (const keyBuf of keyData) {
-    buffer.set(keyBuf, offset);
-    offset += keyBuf.byteLength;
-  }
-
-  return buffer;
-};
-
-const createIlstBox = (data: Record<string, string>): Uint8Array => {
-  const tec = new TextEncoder();
-  const dataStrBuf = tec.encode('data');
-  const valueData = Object.entries(data).map(([_, value], index) => {
-    const keyId = index + 1; // Assuming keys start from 1
-    const valueBytes = tec.encode(value);
-    // size4 + keyId4 + valueSize4 + data4 + idx4 + ?4 + value
-    const entrySize = 4 + 4 + 4 + 4 + 4 + 4 + valueBytes.byteLength;
-
-    const buffer = new Uint8Array(entrySize);
-    const view = new DataView(buffer.buffer);
-    view.setUint32(0, entrySize);
-    view.setUint32(4, keyId);
-
-    view.setUint32(8, 16 + valueBytes.byteLength);
-    buffer.set(dataStrBuf, 12); // 'data' type
-
-    // data idx=1
-    view.setUint32(16, 1);
-    // Value
-    buffer.set(valueBytes, 24);
-
-    return buffer;
+    return keyEntryBuffer;
   });
 
-  const valueDataSize = valueData.reduce((acc, cur) => acc + cur.byteLength, 0);
-  const totalSizwe = 8 + valueDataSize;
-  const buffer = new Uint8Array(totalSizwe);
-  buffer.set(createBoxHeader('ilst', totalSizwe), 0);
+  // Calculate the total size of all encoded key entries.
+  const totalKeyEntriesSize = encodedKeyEntries.reduce(
+    (acc, cur) => acc + cur.byteLength,
+    0,
+  );
 
-  let offset = 8;
-  for (const entry of valueData) {
-    buffer.set(entry, offset);
-    offset += entry.byteLength;
+  // Calculate the total size of the 'keys' box.
+  // BoxHeader (8) + FullBoxVersionFlags (4) + EntryCount (4) + AllKeyEntriesData (variable)
+  const size =
+    8 + // Basic box header
+    4 + // Version and flags
+    4 + // Entry count
+    totalKeyEntriesSize; // Total size of all key entries
+
+  const keysBoxBuffer = new Uint8Array(size);
+  const dataView = new DataView(keysBoxBuffer.buffer);
+
+  // Set the standard box header ('keys' and total size).
+  keysBoxBuffer.set(createBoxHeader('keys', size), 0);
+
+  // FullBox fields: version (0) and flags (0).
+  // Offset 8.
+  dataView.setUint32(8, 0); // Version (1 byte) + Flags (3 bytes) = 0
+
+  // Entry count: the number of keys.
+  // Offset 12.
+  dataView.setUint32(12, keys.length);
+
+  // Concatenate all key entry buffers into the main 'keys' box buffer.
+  let offset = 16; // Start after header, version/flags, and entry count
+  for (const keyEntryBuffer of encodedKeyEntries) {
+    keysBoxBuffer.set(keyEntryBuffer, offset);
+    offset += keyEntryBuffer.byteLength;
   }
 
-  return buffer;
+  return keysBoxBuffer;
 };
 
-export const createMetaBox = (data: Record<string, string>): Uint8Array => {
+/**
+ * Creates an 'ilst' (Item List) box for iTunes-style metadata.
+ * The 'ilst' box contains the actual metadata values, with each item corresponding
+ * to a key defined in the 'keys' box. Each item is itself a box, where the box type
+ * is the 1-based index of the key in the 'keys' box.
+ *
+ * @param {Record<string, string>} metadataTags - An object where keys are metadata tag names (e.g., "©alb")
+ *                                              and values are the corresponding metadata strings.
+ *                                              The order of keys from Object.entries() will determine the key index.
+ * @returns {Uint8Array} A Uint8Array representing the 'ilst' box.
+ */
+const createIlstBox = (metadataTags: Record<string, string>): Uint8Array => {
+  const textEncoder = new TextEncoder();
+  // The 'data' atom/box type used inside each metadata item.
+  const dataAtomTypeBytes = textEncoder.encode('data');
+
+  // Encode each metadata value into its entry format.
+  // Each entry is a box whose type is the 1-based index of the key.
+  // Inside this box is a 'data' box containing the actual value.
+  const encodedValueEntries = Object.values(metadataTags).map(
+    (value, index) => {
+      // The key index is 1-based.
+      const keyIndex = index + 1;
+      const encodedValue = textEncoder.encode(value);
+
+      // Structure of a single metadata item (e.g., for '©alb'):
+      //   ItemBoxHeader (e.g., type '0001' for keyIndex 1) (8 bytes)
+      //   -> DataBox ('data')
+      //      -> BoxHeader ('data') (8 bytes)
+      //      -> VersionAndFlags (4 bytes, for 'data' box, type, locale)
+      //      -> Value (variable length)
+
+      // Size of the inner 'data' box: Header (8) + Version/Flags (4) + Reserved (4, for locale) + Value (variable)
+      const dataBoxPayloadSize =
+        4 + // Type indicator (0 for UTF-8), and 3 bytes for locale (usually 0)
+        4 + // Reserved for locale / data specific (usually 0)
+        encodedValue.byteLength;
+      const dataBoxSize = 8 + dataBoxPayloadSize; // 'data' box header + payload
+
+      // Size of the outer item box (e.g., '0001')
+      const itemBoxSize = 8 + dataBoxSize; // Item box header + 'data' box
+
+      const itemEntryBuffer = new Uint8Array(itemBoxSize);
+      const dataView = new DataView(itemEntryBuffer.buffer);
+
+      // Write the header for the item box (e.g., type '0001').
+      // The type is the keyIndex as a 32-bit integer.
+      dataView.setUint32(0, itemBoxSize);
+      dataView.setUint32(4, keyIndex); // Box type is the 1-based key index
+
+      // --- Start of the inner 'data' box ---
+      let offset = 8; // Current offset within itemEntryBuffer
+
+      // Write the header for the 'data' box.
+      dataView.setUint32(offset, dataBoxSize); // Size of 'data' box
+      offset += 4;
+      itemEntryBuffer.set(dataAtomTypeBytes, offset); // Type 'data'
+      offset += dataAtomTypeBytes.byteLength;
+
+      // Write Version (0) and Flags (1 for UTF-8 data, or other types).
+      // For 'data' atom: 3 bytes type (000001 for UTF-8), 1 byte locale (00)
+      dataView.setUint32(offset, 1); // Type = 1 (UTF-8). Assuming no specific locale.
+      offset += 4;
+
+      // Reserved 4 bytes (often zeros, part of 'data' atom before actual data)
+      dataView.setUint32(offset, 0);
+      offset += 4;
+
+      // Write the actual metadata value.
+      itemEntryBuffer.set(encodedValue, offset);
+
+      return itemEntryBuffer;
+    },
+  );
+
+  // Calculate the total size of all encoded value entries.
+  const totalValueEntriesSize = encodedValueEntries.reduce(
+    (acc, cur) => acc + cur.byteLength,
+    0,
+  );
+
+  // Calculate the total size of the 'ilst' box.
+  // BoxHeader (8) + AllValueEntriesData (variable)
+  const ilstBoxSize = 8 + totalValueEntriesSize;
+  const ilstBoxBuffer = new Uint8Array(ilstBoxSize);
+
+  // Set the standard box header ('ilst' and total size).
+  ilstBoxBuffer.set(createBoxHeader('ilst', ilstBoxSize), 0);
+
+  // Concatenate all value entry buffers into the main 'ilst' box buffer.
+  let offset = 8; // Start after 'ilst' box header
+  for (const valueEntryBuffer of encodedValueEntries) {
+    ilstBoxBuffer.set(valueEntryBuffer, offset);
+    offset += valueEntryBuffer.byteLength;
+  }
+
+  return ilstBoxBuffer;
+};
+
+/**
+ * Creates a 'meta' (Metadata) box containing iTunes-style metadata.
+ * The 'meta' box is a container for other boxes:
+ * - 'hdlr': Specifies the handler type for the metadata.
+ * - 'keys': Lists the metadata keys.
+ * - 'ilst': Contains the actual metadata values corresponding to the keys.
+ *
+ * Note: This function creates a 'meta' box that is typically found inside the 'udta' (User Data) box.
+ * The full structure is often moov -> udta -> meta.
+ * The 'meta' box itself does not have the standard version/flags if it's the top-level one in 'udta'.
+ * However, if it were a full box (e.g. within another box), it would need a version/flags field.
+ * This implementation creates a simple 'meta' box containing 'hdlr', 'keys', and 'ilst'.
+ *
+ * @param {Record<string, string>} metadataTags - An object where keys are metadata tag names (e.g., "©alb", "©art")
+ *                                              and values are the corresponding metadata strings.
+ * @returns {Uint8Array} A Uint8Array representing the 'meta' box and its children.
+ */
+export const createMetaBox = (
+  metadataTags: Record<string, string>,
+): Uint8Array => {
+  // Create the child boxes.
   const hdlrBox = createHdlrBox();
-  const keysBox = createKeysBox(Object.keys(data));
-  const ilstBox = createIlstBox(data);
+  const keysBox = createKeysBox(Object.keys(metadataTags));
+  const ilstBox = createIlstBox(metadataTags);
 
-  const size = hdlrBox.length + keysBox.length + ilstBox.length;
-  const buffer = new Uint8Array(size);
+  // Calculate the total size of the 'meta' box (sum of its children's sizes).
+  // Note: The 'meta' box itself also has a header.
+  const metaBoxPayloadSize = hdlrBox.length + keysBox.length + ilstBox.length;
+  const metaBoxTotalSize = 8 + metaBoxPayloadSize; // 8 bytes for 'meta' box header
 
-  // buffer.set(createBoxHeader('meta', size), 0);
-  buffer.set(hdlrBox, 0);
-  buffer.set(keysBox, hdlrBox.length);
-  buffer.set(ilstBox, hdlrBox.length + keysBox.length);
+  const metaBoxBuffer = new Uint8Array(metaBoxTotalSize);
 
-  return buffer;
+  // Write the 'meta' box header.
+  metaBoxBuffer.set(createBoxHeader('meta', metaBoxTotalSize), 0);
+
+  // According to ISO 14496-12, the 'meta' box is a FullBox, so it should have version/flags.
+  // Set version = 0, flags = 0.
+  // This is 4 bytes after the initial 8-byte header (size and type).
+  const dataView = new DataView(metaBoxBuffer.buffer);
+  dataView.setUint32(8, 0); // Version (1 byte) + Flags (3 bytes) = 0. Offset from start of 'meta' box.
+
+  // Concatenate the child boxes into the 'meta' box buffer.
+  // Offset starts after 'meta' header (8 bytes) AND version/flags (4 bytes).
+  let offset = 12;
+  metaBoxBuffer.set(hdlrBox, offset);
+  offset += hdlrBox.length;
+  metaBoxBuffer.set(keysBox, offset);
+  offset += keysBox.length;
+  metaBoxBuffer.set(ilstBox, offset);
+  // offset += ilstBox.length; // Not needed as it's the last one
+
+  return metaBoxBuffer;
 };
+```

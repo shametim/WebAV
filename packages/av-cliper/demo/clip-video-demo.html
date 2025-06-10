@@ -14,12 +14,9 @@
 
   <script type="module">
     import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
-    // Assuming opfs-tools is available or not strictly needed for this basic demo version
-    // If opfs-tools or a similar helper for file handling is essential,
-    // ensure it's correctly imported and used.
-    // For simplicity, this demo might initially attempt direct stream/file handling
-    // compatible with browser capabilities.
+    import { tmpfile, write } from 'opfs-tools'; // Added import for opfs-tools
 
+    // ... (createFileWriter function remains the same) ...
     async function createFileWriter(extName) {
       const fileHandle = await window.showSaveFilePicker({
         suggestedName: `WebAV-export-${Date.now()}.${extName}`,
@@ -30,21 +27,24 @@
     document.getElementById('processButton').addEventListener('click', async () => {
       const fileInput = document.getElementById('fileInput');
       const status = document.getElementById('status');
-      const outputVideo = document.getElementById('outputVideo');
+      // const outputVideo = document.getElementById('outputVideo'); // Output video display is not directly implemented
 
       if (!fileInput.files || fileInput.files.length === 0) {
         status.textContent = 'No file selected';
         return;
       }
 
-      const inputFile = fileInput.files[0];
+      const uploadedFile = fileInput.files[0]; // Renamed from inputFile for clarity
       status.textContent = 'Processing file...';
 
       try {
-        // Direct use of inputFile, assuming MP4Clip can handle it or adapt.
-        // If MP4Clip requires a specific File-like object or path from a different FS,
-        // this part might need adjustment (e.g., using a temp file solution if available).
-        const clip = new MP4Clip(inputFile, { audio: false }); // Audio processing set to false for this demo
+        status.textContent = 'Writing file to temporary storage...';
+        const tempFile = tmpfile(); // Create OPFS temp file
+        const fileStream = uploadedFile.stream();
+        await write(tempFile, fileStream); // Write uploaded file to OPFS temp file
+        status.textContent = 'Temporary file created. Creating clip...';
+
+        const clip = new MP4Clip(tempFile, { audio: false }); // Use OPFS tempFile
         await clip.ready;
         status.textContent = 'Clip ready. Clipping first 5 seconds...';
 
@@ -61,19 +61,9 @@
         await combinator.addSprite(sprite);
 
         const stream = combinator.output();
-        // Displaying the output might require converting the stream to a playable format or URL
-        // For direct playback in <video>, a Blob URL is a common approach.
         const writableStream = await createFileWriter('mp4');
         await stream.pipeTo(writableStream);
         status.textContent = 'Video processed and saved.';
-
-        // To display in <video> tag, we need a blob URL.
-        // This part is tricky as writableStream from showSaveFilePicker doesn't directly give a blob.
-        // A workaround is to re-read the saved file as a blob, or use a library that simplifies this.
-        // For now, this demo focuses on the clipping and exporting part.
-        // A message will indicate completion, actual playback might require manual file opening.
-        // Or, if opfs-tools or similar is used to write to a temporary OPFS file,
-        // that file could potentially be read as a blob for playback.
 
         // Cleanup
         clip.destroy();

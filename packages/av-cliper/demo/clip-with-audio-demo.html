@@ -14,7 +14,9 @@
 
   <script type="module">
     import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
+    import { tmpfile, write } from 'opfs-tools'; // Added import for opfs-tools
 
+    // ... (createFileWriter function remains the same) ...
     async function createFileWriter(extName) {
       const fileHandle = await window.showSaveFilePicker({
         suggestedName: `WebAV-export-${Date.now()}.${extName}`,
@@ -25,18 +27,25 @@
     document.getElementById('processButton').addEventListener('click', async () => {
       const fileInput = document.getElementById('fileInput');
       const status = document.getElementById('status');
-      const outputVideo = document.getElementById('outputVideo');
+      // const outputVideo = document.getElementById('outputVideo'); // Output video display is not directly implemented
 
       if (!fileInput.files || fileInput.files.length === 0) {
         status.textContent = 'No file selected';
         return;
       }
 
-      const inputFile = fileInput.files[0];
+      const uploadedFile = fileInput.files[0];
       status.textContent = 'Processing file...';
 
       try {
-        const clip = new MP4Clip(inputFile, { audio: true }); // Audio processing set to true
+        status.textContent = 'Writing file to temporary storage...';
+        const tempFile = tmpfile(); // Create OPFS temp file
+        const fileStream = uploadedFile.stream();
+        await write(tempFile, fileStream); // Write uploaded file to OPFS temp file
+        status.textContent = 'Temporary file created. Creating clip...';
+
+        // Use OPFS tempFile, ensure audio: true is maintained
+        const clip = new MP4Clip(tempFile, { audio: true });
         await clip.ready;
         status.textContent = 'Clip ready. Clipping first 5 seconds (with audio)...';
 

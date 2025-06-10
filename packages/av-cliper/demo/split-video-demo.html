@@ -19,7 +19,9 @@
 
   <script type="module">
     import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
+    import { tmpfile, write } from 'opfs-tools'; // Added import for opfs-tools
 
+    // ... (createFileWriter function remains the same) ...
     async function createFileWriter(extName, suggestedNamePrefix = 'WebAV-export') {
       const fileHandle = await window.showSaveFilePicker({
         suggestedName: `${suggestedNamePrefix}-${Date.now()}.${extName}`,
@@ -30,22 +32,32 @@
     document.getElementById('processButton').addEventListener('click', async () => {
       const fileInput = document.getElementById('fileInput');
       const status = document.getElementById('status');
-      // const outputVideo1 = document.getElementById('outputVideo1');
-      // const outputVideo2 = document.getElementById('outputVideo2');
+      // Video elements for direct playback are not directly used with showSaveFilePicker output
 
       if (!fileInput.files || fileInput.files.length === 0) {
         status.textContent = 'No file selected';
         return;
       }
 
-      const inputFile = fileInput.files[0];
+      const uploadedFile = fileInput.files[0];
       status.textContent = 'Processing file...';
 
-      let clip;
-      let clipsToDestroy = [];
+      let clip; // MP4Clip instance
+      let clipsToDestroy = []; // For managing created clips that need cleanup
 
       try {
-        clip = new MP4Clip(inputFile, { audio: true }); // Assuming audio might be wanted
+        status.textContent = 'Writing file to temporary storage...';
+        const tempFile = tmpfile(); // Create OPFS temp file
+        const fileStream = uploadedFile.stream();
+        await write(tempFile, fileStream); // Write uploaded file to OPFS temp file
+        status.textContent = 'Temporary file created. Creating clip...';
+
+        clip = new MP4Clip(tempFile, { audio: true }); // Use OPFS tempFile
+        // Note: 'clip' is added to clipsToDestroy later if its destruction is managed by the array.
+        // However, the original code destroys 'clip' separately in finally.
+        // For consistency, if 'clip' itself is an MP4Clip that should be destroyed,
+        // it could be added to clipsToDestroy, or handled as is.
+
         await clip.ready;
         status.textContent = 'Clip ready. Splitting video at 5 seconds...';
 

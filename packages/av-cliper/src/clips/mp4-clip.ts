@@ -21,18 +21,15 @@ type MPClipCloneArgs = Awaited<ReturnType<typeof mp4FileToSamples>> & {
   localFile: OPFSToolFile; // The local file representation in OPFS
 };
 
-// Interface for MP4 decoder configurations
-interface MP4DecoderConfig {
-  video: VideoDecoderConfig | null; // Video decoder configuration
-  audio: AudioDecoderConfig | null; // Audio decoder configuration
-}
-
 // Options for configuring an MP4Clip instance
 // TODO-REFACTOR: Consider consolidating MP4ClipOpts and MP4DecoderConfig, or nesting decoder configs within MP4ClipOpts
 // to have a single options object for the MP4Clip constructor.
 interface MP4ClipOpts {
   audio?: boolean | { volume: number }; // Audio processing options (enable/disable or set volume)
-  decoderConfig?: MP4DecoderConfig; // Nested decoder config
+  decoderConfig?: {
+    video: VideoDecoderConfig | null; // Video decoder configuration
+    audio: AudioDecoderConfig | null; // Audio decoder configuration
+  };
   /**
    * Unsafe option, may be deprecated at any time.
    * Used to specify hardware acceleration preference for video decoding.
@@ -151,7 +148,10 @@ export class MP4Clip implements IClip {
 
   // Decoder configurations for video and audio
   // This will be populated from opts.decoderConfig or parsed from the file
-  #decoderConfig: MP4DecoderConfig = {
+  #decoderConfig: {
+    video: VideoDecoderConfig | null;
+    audio: AudioDecoderConfig | null;
+  } = {
     video: null,
     audio: null,
   };
@@ -216,7 +216,7 @@ export class MP4Clip implements IClip {
         videoSamples,
         audioSamples,
         // decoderConf is replaced by parsedDecoderConfig in the return type of mp4FileToSamples
-        parsedDecoderConfig, // This will come from mp4FileToSamples or MPClipCloneArgs
+        parsedDecoderConfig, // This will come from mp4FileToSamples or MPClipCloneArgs. Its type is { video: VideoDecoderConfig | null, audio: AudioDecoderConfig | null }
         headerBoxPos,
       }) => {
         this.#videoSamples = videoSamples;
@@ -741,7 +741,7 @@ export class MP4Clip implements IClip {
  * @returns An object containing metadata (duration, width, height, audioSampleRate, audioChanCount).
  */
 function genMeta(
-  decoderConfig: MP4DecoderConfig,
+  decoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null },
   videoSamples: ExtMP4Sample[],
   audioSamples: ExtMP4Sample[],
 ) {
@@ -800,7 +800,7 @@ function genMeta(
 // The parameters (localFileReader, samples, config, logPrefix) are common.
 // Consider if the finders could share more logic or if their construction could be less verbose.
 function genDecoder(
-  decoderConfig: MP4DecoderConfig,
+  decoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null },
   localFileReader: LocalFileReader,
   videoSamples: ExtMP4Sample[],
   audioSamples: ExtMP4Sample[],
@@ -850,61 +850,53 @@ async function _parseMP4File(
   opfsToolsFile: OPFSToolFile,
   logPrefix: string,
 ): Promise<{
-  mp4Info: MP4Info;
-  rawVideoSamples: MP4Sample[];
+  mp4Info: MP4Info; // Ensure this is not duplicated
+  rawVideoSamples: MP4Sample[]; // Ensure this is not duplicated
   rawAudioSamples: MP4Sample[];
-  parsedDecoderConfig: MP4DecoderConfig;
+  parsedDecoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null };
   headerBoxPos: Array<{ start: number; size: number }>;
 }> {
-  let mp4Info: MP4Info | null = null;
-  const parsedDecoderConfig: MP4DecoderConfig = { video: null, audio: null };
-  const rawVideoSamples: MP4Sample[] = [];
-  const rawAudioSamples: MP4Sample[] = [];
-  const headerBoxPos: Array<{ start: number; size: number }> = [];
   const reader = await opfsToolsFile.createReader();
-
-  await quickParseMP4File(
-    reader,
-    (data) => { // onReady
-      mp4Info = data.info;
-      const ftypBox = data.mp4boxFile.ftyp!;
-      headerBoxPos.push({ start: ftypBox.start, size: ftypBox.size });
-      const moovBox = data.mp4boxFile.moov!;
-      headerBoxPos.push({ start: moovBox.start, size: moovBox.size });
-
-      const { videoDecoderConf, audioDecoderConf } = extractFileConfig(data.mp4boxFile, data.info);
-      parsedDecoderConfig.video = videoDecoderConf ?? null;
-      parsedDecoderConfig.audio = audioDecoderConf ?? null;
-
-      if (videoDecoderConf == null && audioDecoderConf == null) {
-        console.error(logPrefix, 'MP4Clip no video and audio track');
-      }
-      console.info(
-        logPrefix,
-        'mp4BoxFile moov ready',
-        { ...data.info, tracks: null, videoTracks: null, audioTracks: null },
-        parsedDecoderConfig,
-      );
-    },
-    (_, type, samples) => { // onSamples
-      if (type === 'video') {
-        rawVideoSamples.push(...samples);
-      } else if (type === 'audio') {
-        rawAudioSamples.push(...samples);
-      }
-    },
-  );
+  // Call the new promise-based quickParseMP4File
+  const { mp4Info, rawVideoSamples, rawAudioSamples, mp4boxFile } = await quickParseMP4File(reader);
   await reader.close();
 
-  if (mp4Info == null) {
-    throw Error(`${logPrefix} MP4Clip stream is done, but not emit ready (mp4Info is null)`);
-  }
   if (rawVideoSamples.length === 0 && rawAudioSamples.length === 0) {
     throw Error(`${logPrefix} MP4Clip stream not contain any sample`);
   }
 
+  // Derive headerBoxPos
+  const headerBoxPos: Array<{ start: number; size: number }> = [];
+  if (mp4boxFile.ftyp != null) {
+    headerBoxPos.push({ start: mp4boxFile.ftyp.start, size: mp4boxFile.ftyp.size });
+  }
+  if (mp4boxFile.moov != null) {
+    headerBoxPos.push({ start: mp4boxFile.moov.start, size: mp4boxFile.moov.size });
+  } else {
+    // This case should ideally be caught by quickParseMP4File if moov is essential
+    throw Error(`${logPrefix} MP4Clip stream is done, but moov box was not found.`);
+  }
+
+  // Derive parsedDecoderConfig
+  const { videoDecoderConf, audioDecoderConf } = extractFileConfig(mp4boxFile, mp4Info);
+  const parsedDecoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null } = {
+    video: videoDecoderConf ?? null,
+    audio: audioDecoderConf ?? null,
+  };
+
+  if (videoDecoderConf == null && audioDecoderConf == null) {
+    console.error(logPrefix, 'MP4Clip no video and audio track');
+  }
+  console.info(
+    logPrefix,
+    'mp4BoxFile moov ready',
+    // Avoid logging verbose track data
+    { ...mp4Info, tracks: null, videoTracks: null, audioTracks: null },
+    parsedDecoderConfig,
+  );
+
   return {
-    mp4Info,
+    mp4Info, // Return the mp4Info obtained from quickParseMP4File
     rawVideoSamples,
     rawAudioSamples,
     parsedDecoderConfig,
@@ -1046,469 +1038,8 @@ function _getVideoSampleNALUInfo(sample: MP4Sample): { offset: number; is_idr: b
 // For instance, defining specific error types or using a retry policy for certain recoverable errors.
 // TODO-REFACTOR: The constructor of `VideoFrameFinder` takes multiple individual parameters.
 // Consider using a single options object for better readability and extensibility if more params are added.
-// REFACTOR-IDEA: Parts of the `find` or `#parseFrame` methods in `VideoFrameFinder` are quite complex.
-// They could potentially be broken down into smaller, more manageable helper methods to improve clarity.
-
-type VideoFrameFinderState =
-  | 'Idle' // Initial state, or after a decode cycle completes and buffer is sufficient or empty.
-  | 'Seeking' // Resetting decoder, seeking to a new position (usually keyframe).
-  | 'Decoding' // Actively feeding chunks to the VideoDecoder and waiting for output.
-  | 'Buffering' // Frames are in #decodedVideoFrames, find is consuming from this buffer.
-  // SoftwareFallback is not a distinct state, but a configuration preference.
-  | 'Error' // An unrecoverable error occurred.
-  | 'Closed'; // Finder is destroyed.
-
-// Custom Error Classes
-class VideoFrameFinderError extends Error {
-  constructor(message: string, public readonly finderState?: any) {
-    super(message);
-    this.name = this.constructor.name;
-  }
-}
-class DecoderSetupError extends VideoFrameFinderError {}
-class DecodingError extends VideoFrameFinderError {}
-class TimeoutError extends VideoFrameFinderError {}
-class StateError extends VideoFrameFinderError {}
-class SampleReadError extends VideoFrameFinderError {}
-
-
-class VideoFrameFinder {
-  #decoder: VideoDecoder | null = null; // The VideoDecoder instance
-  #logPrefix: string; // Prefix for console logging
-  #state: VideoFrameFinderState = 'Idle';
-  #lastError: Error | null = null;
-
-  constructor(
-    public localFileReader: LocalFileReader, // Reader for the OPFS file
-    public samples: ExtMP4Sample[], // Array of extended video samples
-    public config: VideoDecoderConfig, // Video decoder configuration
-    logPrefix: string,
-  ) {
-    this.#logPrefix = `${logPrefix} VideoFrameFinder:`;
-  }
-  
-  #currentTimestamp = 0; // Timestamp of the last requested frame (microseconds)
-  #currentAborter = { abort: false, startTime: performance.now() }; // Aborter for ongoing find operation
-  /**
-   * Finds and returns a VideoFrame for the specified time.
-   * @param time - The target time in microseconds.
-   * @param mode - Decoding mode ('accurate' for precision, 'fast' for speed).
-   * @returns A Promise that resolves to a VideoFrame or null if not found or aborted.
-   */
-  find = async (time: number, mode: 'accurate' | 'fast' = 'accurate'): Promise<VideoFrame | null> => {
-    if (this.#state === 'Closed') {
-      throw new StateError(`${this.#logPrefix} Find called on a closed VideoFrameFinder.`, this.#getState());
-    }
-    if (this.#state === 'Error') {
-      throw new StateError(
-        `${this.#logPrefix} Find called on VideoFrameFinder in Error state. Last error: ${this.#lastError?.message}`,
-        { finderState: this.#getState(), cause: this.#lastError }
-      );
-    }
-
-    this.#currentAborter.abort = true; // Abort any previous find operation (from other find calls)
-    this.#currentAborter = { abort: false, startTime: performance.now() }; // Setup new aborter for this call
-    this.#currentTimestamp = time;
-
-    const needsReset =
-      this.#decoder == null ||
-      this.#decoder.state === 'closed' ||
-      time <= this.#currentTimestamp || // Seeking backward or to current time always resets
-      (mode === 'accurate' && time - this.#currentTimestamp > 3e6) || // Accurate mode, large forward jump
-      (mode === 'fast' && time - this.#currentTimestamp > 10e6);     // Fast mode, very large forward jump
-
-    if (needsReset) {
-      // #reset will handle setting state to 'Seeking' and then to 'Idle' or 'Buffering'
-      this.#reset(time);
-    } else if (this.#state !== 'Decoding' && this.#state !== 'Buffering' && this.#state !== 'Seeking') {
-      // If not resetting and not already in an active processing state, ensure we are ready to parse.
-      // This could happen if the finder was 'Idle'.
-      // If 'Seeking', #reset would have handled it.
-      // No explicit state change needed here if #parseFrame handles it,
-      // but typically we'd expect to be 'Buffering' or 'Idle' if not needing reset.
-    }
-
-    // #parseFrame will now use and potentially change the state.
-    const videoFrame = await this.#parseFrame(
-      time,
-      // this.#decoder should be valid here due to reset logic or prior configuration
-      this.#decoder!,
-      this.#currentAborter,
-      mode,
-    );
-    this.#sleepCount = 0;
-    return videoFrame;
-  };
-
-  #lastVideoFrameDuration = 0; // Stores the duration of the last decoded VideoFrame, used if a frame lacks duration
-
-  #useSoftwareDecoding = false; // Flag to indicate if software decoding is being used (after hardware failure)
-  #decodeCursorIndex = 0; // Current index in the samples array for decoding
-  #decodedVideoFrames: VideoFrame[] = []; // Buffer for decoded video frames
-  #outputFrameCount = 0; // Counter for frames output by the decoder
-  #inputChunkCount = 0; // Counter for chunks sent to the decoder
-  #sleepCount = 0; // Counter for how many times parsing has slept waiting for frames
-  #predecodeError = false; // Flag if an error occurred during pre-decoding
-
-  /**
-   * Internal method to parse frames until the target time is reached.
-   * Manages decoding, frame buffering, and error handling.
-   * @param time - Target time in microseconds.
-   * @param decoder - The VideoDecoder instance.
-   * @param aborter - Abort controller for the current find operation.
-   * @returns A Promise resolving to a VideoFrame or null.
-   * @throws Error if decoding times out.
-   */
-  #parseFrame = async (
-    time: number,
-    decoder: VideoDecoder, // find() ensures decoder is not null before calling #parseFrame
-    aborter: { abort: boolean; startTime: number },
-    mode: 'accurate' | 'fast',
-  ): Promise<VideoFrame | null> => {
-    if (aborter.abort) return null;
-    if (this.#state === 'Closed') {
-      // If called when closed, it's a state issue, but find() should prevent this.
-      // However, if an abort happens and then it's called, this check is useful.
-      return null;
-    }
-    if (this.#state === 'Error') {
-      // If already in an error state, propagate the existing error.
-      throw new StateError(
-        `${this.#logPrefix} #parseFrame called while in Error state. Last error: ${this.#lastError?.message}`,
-        { finderState: this.#getState(), cause: this.#lastError }
-      );
-    }
-
-    // Try to get frame from buffer first
-    if (this.#decodedVideoFrames.length > 0) {
-      const videoFrame = this.#decodedVideoFrames[0];
-      if (time < videoFrame.timestamp) { // Target time is before the first buffered frame (e.g. seeked back)
-        this.#state = 'Idle'; // Or 'Seeking' if find() decided a reset. find() should handle this.
-        return null;
-      }
-
-      this.#decodedVideoFrames.shift();
-      if (time <= videoFrame.timestamp + (videoFrame.duration ?? this.#lastVideoFrameDuration)) {
-        // Frame is suitable, return it.
-        // If buffer is running low, trigger pre-decoding for next frames.
-        const predecodeThreshold = mode === 'fast' ? 1 : 5; // Smaller threshold for fast mode
-        if (this.#decodedVideoFrames.length < predecodeThreshold && this.#state !== 'Decoding') {
-            // Don't await, let it run in background
-            this.#startDecode(decoder, mode).catch(err => {
-                console.error(this.#logPrefix, "Error during background pre-decode:", err);
-                // Error in background decode might lead to Error state if not handled by decoder's error cb
-            });
-        }
-        // If we consumed a frame, we were effectively 'Buffering' or have now transitioned to it.
-        if (this.#decodedVideoFrames.length > 0) this.#state = 'Buffering';
-        else if (this.#state !== 'Decoding') this.#state = 'Idle'; // Buffer empty, not actively decoding new ones
-        return videoFrame;
-      }
-      // Frame is too old, close it and continue parsing for a newer frame.
-      videoFrame.close();
-      return this.#parseFrame(time, decoder, aborter, mode); // Recurse
-    }
-
-    // Buffer is empty, need to interact with decoder or wait
-    switch (this.#state) {
-      case 'Idle':
-      case 'Buffering': // Buffer became empty, need more frames
-        if (this.#decodeCursorIndex >= this.samples.length && this.#inputChunkCount >= this.#outputFrameCount) {
-          // All samples processed and all processed input has been output
-          this.#state = 'Idle';
-          return null;
-        }
-        // Need more frames, start decoding
-        await this.#startDecode(decoder, mode); // This will set state to 'Decoding'
-        break; // Fall through to wait or re-evaluate state after starting decode.
-
-      case 'Seeking':
-      case 'Decoding':
-        if (performance.now() - aborter.startTime > 6000) { // 6 seconds timeout
-          const timeoutDetails = { finderState: this.#getState(), decoderState: decoder.state, queueSize: decoder.decodeQueueSize };
-          const timeoutError = new TimeoutError(
-            `${this.#logPrefix} Video decoding timed out after 6s.`,
-            timeoutDetails
-          );
-          console.error(timeoutError.message, timeoutError.finderState);
-          this.#state = 'Error';
-          this.#lastError = timeoutError;
-          throw timeoutError;
-        }
-        this.#sleepCount += 1;
-        await sleep(15);
-        break;
-
-      // 'Error' and 'Closed' states are handled at the top of the function.
-    }
-
-    // After waiting or action, recurse to re-evaluate or get frame from buffer
-    return this.#parseFrame(time, decoder, aborter, mode);
-  };
-
-  /**
-   * Starts decoding the next Group of Pictures (GoP) from the sample list.
-   * @param decoder - The VideoDecoder instance.
-   * @param mode - Decoding mode.
-   */
-  #startDecode = async (decoder: VideoDecoder, mode: 'accurate' | 'fast') => {
-    // Only start decoding if we are in a state that allows it (Idle, or Buffering and need more)
-    // and not already decoding.
-    if (this.#state === 'Decoding' || this.#state === 'Closed' || this.#state === 'Error' || this.#state === 'Seeking') {
-      return;
-    }
-
-    // In 'fast' mode, be more tolerant of a larger queue if it means we might hit a buffered frame sooner.
-    const maxQueueSize = mode === 'fast' ? 900 : 600;
-    // Check decoder.decodeQueueSize only if decoder is configured.
-    if (decoder.state === 'configured' && decoder.decodeQueueSize > maxQueueSize) {
-      // If the queue is too large, we might be producing frames faster than consuming.
-      // Transition to Buffering to allow consumption.
-      this.#state = 'Buffering';
-      return;
-    }
-
-    let endIndex = this.#decodeCursorIndex + 1;
-    if (endIndex > this.samples.length) { // No more samples to decode
-        this.#state = 'Idle'; // Or 'Buffering' if there are still some frames in #decodedVideoFrames
-        return;
-    }
-
-    this.#state = 'Decoding'; // Set state to Decoding
-    let hasValidFrameInGoP = false;
-    for (let i = this.#decodeCursorIndex; i < endIndex; i++) {
-      if (i < this.samples.length && !this.samples[i].deleted) {
-        hasValidFrameInGoP = true;
-        break;
-      }
-    }
-    // Extend endIndex to find the actual end of the GoP
-    for (; endIndex < this.samples.length; endIndex++) {
-      if (this.samples[endIndex].is_idr) break;
-    }
-
-    if (hasValidFrameInGoP) {
-      const gopSamples = this.samples.slice(this.#decodeCursorIndex, endIndex);
-      if (gopSamples.length > 0 && gopSamples[0]?.is_idr !== true) {
-        console.warn(this.#logPrefix, 'First sample of GoP not an IDR frame for decoding.');
-      }
-
-      if (gopSamples.length > 0) {
-        let chunks: EncodedVideoChunk[] = [];
-        try {
-          const readStartTime = performance.now();
-          chunks = await videoSamplesToEncodedChunks(
-            gopSamples,
-            this.localFileReader,
-          );
-          const readDuration = performance.now() - readStartTime;
-          if (readDuration > 1000) {
-             const firstSample = gopSamples[0];
-             const lastSample = gopSamples.at(-1)!;
-             const rangeSize =
-               lastSample.offset + lastSample.size - firstSample.offset;
-             console.warn(
-               this.#logPrefix,
-               `Read video samples time cost: ${Math.round(
-                 readDuration,
-               )}ms, file chunk size: ${rangeSize}`,
-             );
-          }
-        } catch (error: any) {
-          const sampleReadError = new SampleReadError(
-            `${this.#logPrefix} Failed to read video samples: ${error?.message}`,
-            { finderState: this.#getState(), cause: error }
-          );
-          console.error(sampleReadError.message, sampleReadError.finderState);
-          this.#state = 'Error';
-          this.#lastError = sampleReadError;
-          return;
-        }
-
-        if (this.#state !== 'Decoding' || decoder.state === 'closed') { return; }
-
-        this.#lastVideoFrameDuration = chunks[0]?.duration ?? 0;
-        try {
-          decodeGoP(decoder, chunks, { /* onDecodingError is handled by decoder.error callback */ });
-        } catch (error: any) {
-           const decodingError = new DecodingError(
-             `${this.#logPrefix} Synchronous error during decodeGoP: ${error?.message}`,
-             { finderState: this.#getState(), cause: error }
-           );
-           console.error(decodingError.message, decodingError.finderState);
-           this.#state = 'Error';
-           this.#lastError = decodingError;
-           return;
-        }
-        this.#inputChunkCount += chunks.length;
-      } else {
-        // No valid samples in this range, perhaps move to idle if at end.
-         if (this.#decodeCursorIndex >= this.samples.length) {
-            this.#state = 'Idle';
-        }
-      }
-    } else {
-      // No valid frames left to decode in the identified GoP range or samples list
-      this.#state = 'Idle'; // Transition to Idle as there's nothing more to start decoding now
-    }
-    this.#decodeCursorIndex = endIndex;
-
-    // If #startDecode was called and it fed some chunks, it's 'Decoding'.
-    // If it fed all chunks for a GoP and is waiting for output, it's still 'Decoding'.
-    // The 'output' callback in #reset will transition to 'Buffering' or 'Idle'.
-    // If no chunks were fed (e.g., end of samples, or no valid GoP), it should be 'Idle'.
-    // The state is already set to 'Decoding' at the start. If it finishes a GoP or can't feed,
-    // it doesn't immediately become 'Idle' here; it relies on output/error callbacks or next #parseFrame cycle.
-  };
-
-  /**
-   * Resets the VideoDecoder instance.
-   * Closes the current decoder, clears frame buffers, and creates a new decoder
-   * configured for the specified time (or start if no time provided).
-   * @param time - Optional time (microseconds) to seek to after reset.
-   */
-  #reset = (time?: number) => {
-    this.#state = 'Seeking';
-    this.#lastError = null; // Clear last error as we are attempting a reset
-    // this.#isDecodingInProgress = false; // Replaced by state
-    this.#decodedVideoFrames.forEach((frame) => frame.close());
-    this.#decodedVideoFrames = [];
-    // this.#predecodeError = false; // Error state will be handled by #state = 'Error'
-
-    // Determine the starting sample index for the new decoder
-    if (time == null || time === 0) {
-      this.#decodeCursorIndex = 0; // Start from the beginning
-    } else {
-      // Find the keyframe index at or before the target time
-      let keyFrameIndex = 0;
-      for (let i = 0; i < this.samples.length; i++) {
-        const sample = this.samples[i];
-        if (sample.is_idr) keyFrameIndex = i; // Update last known keyframe
-        if (sample.cts < time) continue; // If sample is before target time, continue
-        this.#decodeCursorIndex = keyFrameIndex; // Set cursor to the keyframe at/before time
-        break;
-      }
-    }
-    this.#inputChunkCount = 0;
-    this.#outputFrameCount = 0;
-
-    if (this.#decoder?.state !== 'closed' && this.#decoder?.state !== 'unconfigured') {
-      this.#decoder?.close();
-    }
-
-    // The actual VideoDecoderConfig (this.config) should reflect hardwareAcceleration preference
-    // No need for a separate #useSoftwareDecoding flag with the state machine.
-    // If a decode error leads to trying software, this.config itself would be updated.
-
-    this.#decoder = new VideoDecoder({
-      output: (videoFrame) => {
-        if (this.#state === 'Closed') { // If finder was destroyed while decoder was working
-          videoFrame.close();
-          return;
-        }
-        this.#outputFrameCount += 1;
-        if (videoFrame.timestamp === -1) {
-          videoFrame.close();
-          return;
-        }
-        let resultVideoFrame = videoFrame;
-        if (videoFrame.duration == null) {
-          resultVideoFrame = new VideoFrame(videoFrame, {
-            duration: this.#lastVideoFrameDuration,
-          });
-          videoFrame.close();
-        }
-        this.#decodedVideoFrames.push(resultVideoFrame);
-        // If we were decoding, and now have frames, we are buffering.
-        // If find() is waiting, #parseFrame will pick it up.
-        // If no find() is active, we just accumulate.
-        if (this.#state === 'Decoding' || this.#state === 'Seeking') {
-          this.#state = 'Buffering';
-        }
-      },
-      error: (err) => {
-        if (this.#state === 'Closed') return;
-
-        if (err.message.includes('Codec reclaimed due to inactivity')) {
-          this.#decoder = null; // Decoder is gone.
-          this.#state = 'Idle'; // Go to Idle, next find will re-init or fail if source gone.
-          console.warn(this.#logPrefix, err.message);
-          return;
-        }
-
-        // Check if we can try software fallback
-        if (this.config.hardwareAcceleration !== 'prefer-software') {
-          console.warn(
-            this.#logPrefix,
-            `Hardware decode error: ${err.message}. Attempting software fallback.`,
-            this.config
-          );
-          this.config.hardwareAcceleration = 'prefer-software'; // Modify permanently for this finder instance
-          this.#reset(this.#currentTimestamp); // Call reset again, which will use the updated config
-        } else {
-          // Already tried software or it wasn't a hardware issue initially
-          const decodingError = new DecodingError(
-            `${this.#logPrefix} VideoFinder VideoDecoder error: ${err.message}`,
-            { finderState: this.#getState(), cause: err }
-          );
-          console.error(decodingError.message, decodingError.finderState);
-          this.#state = 'Error';
-          this.#lastError = decodingError;
-        }
-      },
-    });
-
-    try {
-      this.#decoder.configure(this.config);
-      // After successful configuration, if we were seeking, we are now idle, ready for #startDecode.
-      if (this.#state === 'Seeking') { // Check state because error callback might have changed it
-        this.#state = 'Idle';
-      }
-    } catch (error: any) {
-      const setupError = new DecoderSetupError(
-        `${this.#logPrefix} Failed to configure VideoDecoder: ${error?.message}`,
-        { finderState: this.#getState(), cause: error }
-      );
-      console.error(setupError.message, setupError.finderState);
-      this.#state = 'Error';
-      this.#lastError = setupError;
-      // No need to throw here, state is Error, find() will pick it up or #parseFrame
-    }
-  };
-
-  /**
-   * Gets the current state of the VideoFrameFinder for debugging.
-   * @returns An object containing state information.
-   */
-  #getState = () => ({
-    time: this.#currentTimestamp,
-    decoderState: this.#decoder?.state,
-    decoderQueueSize: this.#decoder?.decodeQueueSize,
-    decodeCursorIndex: this.#decodeCursorIndex,
-    sampleLength: this.samples.length,
-    inputChunkCount: this.#inputChunkCount,
-    outputFrameCount: this.#outputFrameCount,
-    cachedFrameCount: this.#decodedVideoFrames.length,
-    isSoftwareDecoding: this.#useSoftwareDecoding,
-    clipInstanceCount: CLIP_ID, // Global count of MP4Clip instances
-    sleepCount: this.#sleepCount,
-    memoryInfo: memoryUsageInfo(), // Browser memory usage if available
-  });
-
-  /**
-   * Destroys the VideoFrameFinder, closing the decoder and file reader.
-   */
-  destroy = () => {
-    if (this.#state === 'Closed') return;
-    this.#state = 'Closed';
-    if (this.#decoder?.state !== 'closed') this.#decoder?.close();
-    this.#decoder = null;
-    this.#currentAborter.abort = true; // Abort any ongoing operations
-    this.#decodedVideoFrames.forEach((frame) => frame.close()); // Close buffered frames
-    this.#decodedVideoFrames = [];
-    this.localFileReader.close(); // Close the file reader
-  };
-}
+// VideoFrameFinder class and related definitions removed.
+// These will be imported from ./video-frame-finder.ts
 
 /**
  * Finds the index of the sample that contains the given time.
@@ -1537,23 +1068,7 @@ function findIndexOfSamples(time: number, samples: ExtMP4Sample[]): number {
 // TODO-REFACTOR: Similar to VideoFrameFinder, `AudioFrameFinder` state management (`#currentTimestamp`, `#decodeCursorIndex`)
 // could be more formalized. Error handling and constructor parameters also follow similar patterns
 // and could benefit from the same refactoring considerations (state machine, structured errors, options object).
-// REFACTOR-IDEA: `AudioFrameFinder`'s `#parseFrame` logic for handling buffer shortages and decoder state
-// could be extracted or simplified for better readability.
-
-interface IAudioFrameFinderOpts {
-  localFileReader: LocalFileReader;
-  samples: ExtMP4Sample[];
-  config: AudioDecoderConfig;
-  outputOpts: { volume: number; targetSampleRate: number };
-  logPrefix: string;
-}
-
-type AudioFrameFinderState =
-  | 'Idle'
-  | 'Decoding'
-  | 'Buffering'
-  | 'Error'
-  | 'Closed';
+// IAudioFrameFinderOpts and AudioFrameFinderState removed.
 
 // Custom Error Classes for AudioFrameFinder
 class AudioFrameFinderError extends Error {
@@ -1566,306 +1081,7 @@ class AudioDecoderError extends AudioFrameFinderError {}
 class AudioTimeoutError extends AudioFrameFinderError {}
 class AudioStateError extends AudioFrameFinderError {}
 // Note: SampleReadError could be generic if audio samples were read from file like video,
-// but audio samples (ExtMP4Sample.data) are kept in memory, so less likely to have this specific error.
-
-class AudioFrameFinder {
-  #volume = 1; // Audio volume (0.0 to 1.0)
-  #targetSampleRate; // Target sample rate for output PCM data
-  #logPrefix: string; // Prefix for console logging
-  #state: AudioFrameFinderState = 'Idle';
-  #lastError: Error | null = null;
-
-  localFileReader: LocalFileReader;
-  samples: ExtMP4Sample[];
-  config: AudioDecoderConfig;
-
-  constructor(opts: IAudioFrameFinderOpts) {
-    this.localFileReader = opts.localFileReader;
-    this.samples = opts.samples;
-    this.config = opts.config;
-    this.#volume = opts.outputOpts.volume;
-    this.#targetSampleRate = opts.outputOpts.targetSampleRate;
-    this.#logPrefix = `${opts.logPrefix} AudioFrameFinder:`;
-    // Initial reset to setup decoder might be good practice, or do it lazily in first find.
-    // For now, let's keep it lazy, first find() will call #reset() if #audioChunksDecoder is null.
-  }
-
-  #audioChunksDecoder: ReturnType<typeof createAudioChunksDecoder> | null = null; // Decoder instance
-  #currentAborter = { abort: false, startTime: performance.now() }; // Aborter for ongoing find operation
-
-  /**
-   * Finds and returns PCM audio data for the specified time.
-   * @param time - The target time in microseconds.
-   * @returns A Promise that resolves to an array of Float32Arrays (PCM data per channel).
-   */
-  find = async (time: number): Promise<Float32Array[]> => {
-    if (this.#state === 'Closed') {
-      throw new AudioStateError(`${this.#logPrefix} Find called on a closed AudioFrameFinder.`, this.#getState());
-    }
-    if (this.#state === 'Error') {
-      throw new AudioStateError(
-        `${this.#logPrefix} Find called on AudioFrameFinder in Error state. Last error: ${this.#lastError?.message}`,
-        { finderState: this.#getState(), cause: this.#lastError }
-      );
-    }
-
-    this.#currentAborter.abort = true;
-    this.#currentAborter = { abort: false, startTime: performance.now() };
-
-    const deltaTime = time - this.#currentTimestamp;
-    // Determine if a reset is needed (significant time jump or decoder closed/null)
-    // Also reset if state is Error, to allow a new find() to retry.
-    const needsReset =
-      this.#audioChunksDecoder == null ||
-      this.#audioChunksDecoder.state === 'closed' || // Decoder specific state
-      time <= this.#currentTimestamp || // Seeking backwards or to current time
-      time - this.#currentTimestamp > 0.1e6; // Seeking forward more than 100ms
-
-    if (needsReset) {
-      this.#reset();
-      // If reset itself lands in an error state (e.g., decoder creation failed)
-      if (this.#state === 'Error') {
-        throw new AudioStateError(
-          `${this.#logPrefix} Error during reset in find(). Last error: ${this.#lastError?.message}`,
-          { finderState: this.#getState(), cause: this.#lastError }
-        );
-      }
-      this.#currentTimestamp = time; // Set current time after successful reset
-      this.#decodeCursorIndex = findIndexOfSamples(time, this.samples);
-    } else {
-      this.#currentTimestamp = time;
-    }
-
-    if (this.#audioChunksDecoder == null) { // Should not happen if reset logic is correct
-        const initError = new AudioDecoderError(`${this.#logPrefix} Decoder not initialized in find() after reset check.`);
-        this.#state = 'Error';
-        this.#lastError = initError;
-        throw initError;
-    }
-
-    const pcmData = await this.#parseFrame(
-      Math.max(0, Math.ceil(deltaTime * (this.#targetSampleRate / 1e6))), // Ensure non-negative frame count
-      this.#audioChunksDecoder,
-      this.#currentAborter,
-    );
-    this.#sleepCount = 0;
-    return pcmData;
-  };
-
-  #currentTimestamp = 0; // Timestamp of the last requested audio data (microseconds)
-  #decodeCursorIndex = 0; // Current index in the audio samples array for decoding
-  #pcmDataBuffer: {
-    frameCount: number; // Total number of frames in the buffer
-    data: [Float32Array, Float32Array][]; // Buffered PCM data (stereo pairs)
-  } = {
-    frameCount: 0,
-    data: [],
-  };
-  #sleepCount = 0; // Counter for how many times parsing has slept waiting for data
-
-  /**
-   * Internal method to parse audio frames until enough data for the requested duration is available.
-   * Manages decoding, buffering, and error handling.
-   * @param emitFrameCount - Number of PCM frames to emit.
-   * @param decoder - The audio chunks decoder instance.
-   * @param aborter - Abort controller for the current find operation.
-   * @returns A Promise resolving to an array of Float32Arrays (PCM data).
-   * @throws Error if decoding times out.
-   */
-  #parseFrame = async (
-    emitFrameCount: number,
-    decoder: ReturnType<typeof createAudioChunksDecoder>, // Assured non-null by find()
-    aborter: { abort: boolean; startTime: number },
-  ): Promise<Float32Array[]> => {
-    if (aborter.abort) return [];
-    if (this.#state === 'Closed') return [];
-    if (this.#state === 'Error') {
-      throw new AudioStateError(
-        `${this.#logPrefix} #parseFrame called while in Error state. Last error: ${this.#lastError?.message}`,
-        { finderState: this.#getState(), cause: this.#lastError }
-      );
-    }
-
-    if (emitFrameCount <= 0) return [];
-
-    // Check if buffered data is sufficient
-    if (this.#pcmDataBuffer.frameCount >= emitFrameCount) {
-      const pcm = emitAudioFrames(this.#pcmDataBuffer, emitFrameCount);
-      // If buffer is running low (heuristic: less than 0.1s of data), and we are not already decoding, try to fill it.
-      if (this.#pcmDataBuffer.frameCount < this.#targetSampleRate / 10 && this.#state !== 'Decoding') {
-        this.#startDecode(decoder); // Don't await, let it run in background
-      }
-      // Set state based on remaining buffer.
-      if (this.#pcmDataBuffer.frameCount > 0 && this.#state !== 'Decoding') this.#state = 'Buffering';
-      else if (this.#state !== 'Decoding') this.#state = 'Idle';
-      return pcm;
-    }
-
-    // Buffer is not sufficient, need to decode or wait for decoding.
-    switch (this.#state) {
-      case 'Idle':
-      case 'Buffering': // Buffer has some data, but not enough for emitFrameCount
-        if (this.#decodeCursorIndex >= this.samples.length && !decoder.isDecoding && this.#pcmDataBuffer.frameCount < emitFrameCount) {
-          // All samples have been submitted for decoding, decoder is not busy, and buffer still not enough.
-          // This means we're at the end. Emit what's left.
-          const remainingPCM = emitAudioFrames(this.#pcmDataBuffer, this.#pcmDataBuffer.frameCount);
-          this.#state = 'Idle';
-          return remainingPCM;
-        }
-        // Not enough data, and more samples might be available or decoder might be working.
-        this.#startDecode(decoder); // This will change state to 'Decoding' if it proceeds.
-        break; // Fall through to wait for decoding.
-
-      case 'Decoding': // Decoder is busy
-        if (performance.now() - aborter.startTime > 3000) { // 3 seconds timeout
-          const timeoutError = new AudioTimeoutError(
-            `${this.#logPrefix} Audio decoding timed out after 3s.`,
-            { finderState: this.#getState(), decoderInternalState: decoder.state }
-          );
-          console.error(timeoutError.message, timeoutError.finderState);
-          this.#state = 'Error';
-          this.#lastError = timeoutError;
-          aborter.abort = true; // Ensure no more operations for this find call
-          throw timeoutError;
-        }
-        this.#sleepCount += 1;
-        await sleep(15);
-        break;
-
-      // 'Error' and 'Closed' are handled at the top.
-    }
-    // After action (like starting decode or waiting), recurse to re-evaluate.
-    return this.#parseFrame(emitFrameCount, decoder, aborter);
-  };
-
-  /**
-   * Starts decoding a batch of audio samples.
-   * @param decoder - The audio chunks decoder instance.
-   */
-  #startDecode = (decoder: ReturnType<typeof createAudioChunksDecoder>) => {
-    if (this.#state === 'Decoding' || this.#state === 'Closed' || this.#state === 'Error') {
-      return;
-    }
-
-    const decodeBatchSize = 10;
-    // Check decoder.decodeQueueSize only if decoder is not null and state is not closed
-    if (decoder.state !== 'closed' && decoder.decodeQueueSize > decodeBatchSize) {
-      this.#state = 'Buffering'; // Queue is full, let's assume we are buffering
-      return;
-    }
-
-    this.#state = 'Decoding';
-
-    const samplesToDecode = [];
-    let i = this.#decodeCursorIndex;
-    while (i < this.samples.length) {
-      const sample = this.samples[i];
-      i += 1;
-      if (sample.deleted) continue;
-      samplesToDecode.push(sample);
-      if (samplesToDecode.length >= decodeBatchSize) break;
-    }
-    this.#decodeCursorIndex = i;
-
-    if (samplesToDecode.length === 0) {
-      this.#state = 'Idle'; // No samples left to decode for now
-      return;
-    }
-
-    try {
-      decoder.decode(
-        samplesToDecode.map(
-          (sample) =>
-            new EncodedAudioChunk({
-              type: 'key',
-              timestamp: sample.cts,
-              duration: sample.duration,
-              data: sample.data!,
-            }),
-        ),
-      );
-    } catch (error: any) {
-      const adError = new AudioDecoderError(
-        `${this.#logPrefix} Error during audioChunksDecoder.decode: ${error?.message}`,
-        { finderState: this.#getState(), cause: error }
-      );
-      console.error(adError.message, adError.finderState);
-      this.#state = 'Error';
-      this.#lastError = adError;
-    }
-    // State remains 'Decoding'; the 'output' callback in #reset will transition to 'Buffering' or 'Idle'.
-  };
-
-  /**
-   * Resets the AudioDecoder instance and clears buffers.
-   * Creates a new decoder instance.
-   */
-  #reset = () => {
-    this.#currentTimestamp = 0;
-    this.#decodeCursorIndex = 0;
-    this.#pcmDataBuffer = { frameCount: 0, data: [] };
-    this.#lastError = null; // Clear any previous error on reset
-
-    this.#audioChunksDecoder?.close();
-    try {
-      this.#audioChunksDecoder = createAudioChunksDecoder(
-        this.config,
-        {
-          resampleRate: this.#targetSampleRate,
-          volume: this.#volume,
-        },
-        (pcmArray) => { // onDecode
-          if (this.#state === 'Closed') return;
-          this.#pcmDataBuffer.data.push(pcmArray as [Float32Array, Float32Array]);
-          this.#pcmDataBuffer.frameCount += pcmArray[0].length;
-          if (this.#state === 'Decoding') this.#state = 'Buffering';
-        },
-        this.#logPrefix, // For createAudioChunksDecoder's internal logging
-      );
-      this.#state = 'Idle'; // Successfully reset and ready
-    } catch (error: any) {
-      const adError = new AudioDecoderError(
-        `${this.#logPrefix} Failed to create audio decoder: ${error?.message}`,
-        { cause: error, targetSampleRate: this.#targetSampleRate, volume: this.#volume }
-      );
-      console.error(adError.message, adError.finderState);
-      this.#state = 'Error';
-      this.#lastError = adError;
-      // No throw here; state indicates error. find() will throw.
-    }
-  };
-
-  /**
-   * Gets the current state of the AudioFrameFinder for debugging.
-   * @returns An object containing state information.
-   */
-  #getState = () => ({
-    state: this.#state,
-    lastError: this.#lastError?.message,
-    time: this.#currentTimestamp,
-    decoderState: this.#audioChunksDecoder?.state,
-    decoderQueueSize: this.#audioChunksDecoder?.decodeQueueSize,
-    decodeCursorIndex: this.#decodeCursorIndex,
-    sampleLength: this.samples.length,
-    pcmFrameCountInBuffer: this.#pcmDataBuffer.frameCount,
-    clipInstanceCount: CLIP_ID, // Global count of MP4Clip instances
-    sleepCount: this.#sleepCount,
-    memoryInfo: memoryUsageInfo(),
-  });
-
-  /**
-   * Destroys the AudioFrameFinder, closing the decoder.
-   */
-  destroy = () => {
-    if (this.#state === 'Closed') return;
-    this.#state = 'Closed';
-    this.#audioChunksDecoder?.close();
-    this.#audioChunksDecoder = null;
-    this.#currentAborter.abort = true;
-    this.#pcmDataBuffer = { frameCount: 0, data: [] };
-    this.localFileReader.close();
-  };
-}
+// AudioFrameFinder class and related definitions removed.
 
 /**
  * Creates an audio decoder that processes EncodedAudioChunks,

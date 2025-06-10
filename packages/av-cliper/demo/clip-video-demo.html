@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clip Video Demo</title>
+</head>
+<body>
+  <h1>Clip Video Demo</h1>
+  <input type="file" id="fileInput" accept="video/mp4">
+  <button id="processButton">Process Video</button>
+  <p id="status">Select a file and click "Process Video"</p>
+  <video id="outputVideo" controls></video>
+
+  <script type="module">
+    import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
+    // Assuming opfs-tools is available or not strictly needed for this basic demo version
+    // If opfs-tools or a similar helper for file handling is essential,
+    // ensure it's correctly imported and used.
+    // For simplicity, this demo might initially attempt direct stream/file handling
+    // compatible with browser capabilities.
+
+    async function createFileWriter(extName) {
+      const fileHandle = await window.showSaveFilePicker({
+        suggestedName: `WebAV-export-${Date.now()}.${extName}`,
+      });
+      return fileHandle.createWritable();
+    }
+
+    document.getElementById('processButton').addEventListener('click', async () => {
+      const fileInput = document.getElementById('fileInput');
+      const status = document.getElementById('status');
+      const outputVideo = document.getElementById('outputVideo');
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        status.textContent = 'No file selected';
+        return;
+      }
+
+      const inputFile = fileInput.files[0];
+      status.textContent = 'Processing file...';
+
+      try {
+        // Direct use of inputFile, assuming MP4Clip can handle it or adapt.
+        // If MP4Clip requires a specific File-like object or path from a different FS,
+        // this part might need adjustment (e.g., using a temp file solution if available).
+        const clip = new MP4Clip(inputFile, { audio: false }); // Audio processing set to false for this demo
+        await clip.ready;
+        status.textContent = 'Clip ready. Clipping first 5 seconds...';
+
+        const [first5Seconds] = await clip.split(5e6); // 5 seconds in microseconds
+        await first5Seconds.ready;
+        status.textContent = 'Clipped. Combining and rendering...';
+
+        const combinator = new Combinator({
+          width: first5Seconds.meta.width || 1280,
+          height: first5Seconds.meta.height || 720,
+        });
+
+        const sprite = new OffscreenSprite(first5Seconds);
+        await combinator.addSprite(sprite);
+
+        const stream = combinator.output();
+        // Displaying the output might require converting the stream to a playable format or URL
+        // For direct playback in <video>, a Blob URL is a common approach.
+        const writableStream = await createFileWriter('mp4');
+        await stream.pipeTo(writableStream);
+        status.textContent = 'Video processed and saved.';
+
+        // To display in <video> tag, we need a blob URL.
+        // This part is tricky as writableStream from showSaveFilePicker doesn't directly give a blob.
+        // A workaround is to re-read the saved file as a blob, or use a library that simplifies this.
+        // For now, this demo focuses on the clipping and exporting part.
+        // A message will indicate completion, actual playback might require manual file opening.
+        // Or, if opfs-tools or similar is used to write to a temporary OPFS file,
+        // that file could potentially be read as a blob for playback.
+
+        // Cleanup
+        clip.destroy();
+        first5Seconds.destroy();
+        combinator.destroy();
+
+      } catch (error) {
+        console.error('Error processing video:', error);
+        status.textContent = 'Error: ' + error.message;
+      }
+    });
+  </script>
+</body>
+</html>

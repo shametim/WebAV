@@ -1,7 +1,7 @@
 import { EventTool, file2stream, recodemux } from '@webav/internal-utils';
-import { OffscreenSprite } from './sprite/offscreen-sprite';
 import { sleep } from './av-utils';
 import { DEFAULT_AUDIO_CONF } from './clips';
+import { OffscreenSprite } from './sprite/offscreen-sprite';
 
 export interface ICombinatorOptions {
   width?: number; // Output video width
@@ -180,7 +180,11 @@ export class Combinator {
 
     // Determine if a video track is needed based on dimensions.
     this.#hasVideoTrack = this.#options.width * this.#options.height > 0;
-    console.log(this.#logPrefix, 'Combinator initialized with options:', this.#options);
+    console.log(
+      this.#logPrefix,
+      'Combinator initialized with options:',
+      this.#options,
+    );
   }
 
   /**
@@ -280,9 +284,7 @@ export class Combinator {
       mainSprite != null
         ? mainSprite.time.offset + mainSprite.time.duration
         : Math.max(
-            ...this.#sprites.map(
-              (it) => it.time.offset + it.time.duration,
-            ),
+            ...this.#sprites.map((it) => it.time.offset + it.time.duration),
           );
 
     // If maxTime is Infinity, it means some sprites have unbounded duration (e.g., static image with no duration).
@@ -295,11 +297,14 @@ export class Combinator {
     if (maxTimeMicros < 0) {
       console.warn(
         this.#logPrefix,
-        "Unable to determine a valid end time (maxTime < 0). Progress reporting might be affected. Output will proceed based on sprite states.",
+        'Unable to determine a valid end time (maxTime < 0). Progress reporting might be affected. Output will proceed based on sprite states.',
       );
     }
 
-    console.log(this.#logPrefix, `Start combination, calculated maxTime: ${maxTimeMicros}μs`);
+    console.log(
+      this.#logPrefix,
+      `Start combination, calculated maxTime: ${maxTimeMicros}μs`,
+    );
     // Initialize the recodemux operation.
     const recodeMuxOperation = this.#startRecodemuxOperation(maxTimeMicros);
     const MuxStartTime = performance.now();
@@ -425,13 +430,12 @@ export class Combinator {
           return;
         }
         // Update progress (avoid division by zero or negative maxTime).
-        currentProgress = maxTimeMicros > 0 ? currentTimeMicros / maxTimeMicros : 0;
+        currentProgress =
+          maxTimeMicros > 0 ? currentTimeMicros / maxTimeMicros : 0;
 
         // Render all active sprites for the current timestamp.
-        const {
-          audioDataChunks,
-          isMainSpriteDone,
-        } = await spriteRenderer(currentTimeMicros);
+        const { audioDataChunks, isMainSpriteDone } =
+          await spriteRenderer(currentTimeMicros);
 
         // If the main sprite is done, end the combination.
         if (isMainSpriteDone) {
@@ -464,9 +468,14 @@ export class Combinator {
     }, 500);
 
     const finalizeLoop = async () => {
-      if (abortController.aborted && !loopError) { // If aborted cleanly, don't call onEnded if there was an error already.
-         console.log(this.#logPrefix, 'Encoding loop aborted, not calling onEnded.');
-      } else if (!loopError) { // Only call onEnded if no error occurred during the loop itself
+      if (abortController.aborted && !loopError) {
+        // If aborted cleanly, don't call onEnded if there was an error already.
+        console.log(
+          this.#logPrefix,
+          'Encoding loop aborted, not calling onEnded.',
+        );
+      } else if (!loopError) {
+        // Only call onEnded if no error occurred during the loop itself
         await onEnded();
       }
       stopLoop(); // Common cleanup.
@@ -474,7 +483,8 @@ export class Combinator {
 
     // Function to stop the loop and clear resources.
     const stopLoop = () => {
-      if (abortController.aborted && !loopError) { // Check if already stopped to avoid redundant cleanup
+      if (abortController.aborted && !loopError) {
+        // Check if already stopped to avoid redundant cleanup
         // If loopError is set, it means cleanup might have been initiated by the catch block.
         // If aborted is true but no loopError, it means external stop or natural completion.
         return;
@@ -511,7 +521,10 @@ function createSpritesRender(opts: {
 
   return async (
     currentTimeMicros: number,
-  ): Promise<{ audioDataChunks: Float32Array[][]; isMainSpriteDone: boolean }> => {
+  ): Promise<{
+    audioDataChunks: Float32Array[][];
+    isMainSpriteDone: boolean;
+  }> => {
     // Clear canvas with background color.
     context.fillStyle = bgColor;
     context.fillRect(0, 0, width, height);
@@ -595,10 +608,7 @@ function createAVEncoder(opts: {
   // Create an audio buffer to manage and chunk audio data.
   const audioTrackBuffer = createAudioTrackBuffer(1024); // Buffer size of 1024 PCM frames per AudioData.
 
-  return (
-    currentTimeMicros: number,
-    audioDataChunks: Float32Array[][],
-  ) => {
+  return (currentTimeMicros: number, audioDataChunks: Float32Array[][]) => {
     if (outputAudioEnabled) {
       // Process and encode audio data.
       for (const audioData of audioTrackBuffer(
@@ -746,8 +756,7 @@ export function createAudioTrackBuffer(audioDataPcmFrameCount: number) {
           inputAudioTracksPcm[trackIndex][0]?.[sampleIndex] ?? 0;
         // If input is mono, duplicate channel 0 to channel 1.
         const channel1Sample =
-          inputAudioTracksPcm[trackIndex][1]?.[sampleIndex] ??
-          channel0Sample;
+          inputAudioTracksPcm[trackIndex][1]?.[sampleIndex] ?? channel0Sample;
         mixedChannel0Sample += channel0Sample;
         mixedChannel1Sample += channel1Sample;
       }
@@ -796,4 +805,3 @@ async function letEncoderCalmDown(getQueueSize: () => number): Promise<void> {
     await letEncoderCalmDown(getQueueSize); // Recursive call to continue checking.
   }
 }
-```

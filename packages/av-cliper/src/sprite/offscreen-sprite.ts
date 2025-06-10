@@ -1,6 +1,6 @@
-import { BaseSprite } from './base-sprite';
-import { IClip } from '../clips';
 import { changePCMPlaybackRate } from '../av-utils';
+import { IClip } from '../clips';
+import { BaseSprite } from './base-sprite';
 
 /**
  * @class OffscreenSprite
@@ -176,4 +176,3 @@ export class OffscreenSprite extends BaseSprite {
     this.#clip.destroy(); // Destroy the underlying clip.
   }
 }
-```

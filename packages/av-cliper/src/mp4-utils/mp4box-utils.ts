@@ -286,4 +286,3 @@ export async function quickParseMP4File(
     mp4boxFile.stop();
   }
 }
-```

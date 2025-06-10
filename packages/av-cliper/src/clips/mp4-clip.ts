@@ -842,10 +842,9 @@ class VideoFrameFinder {
   ) {
     this.#logPrefix = `${logPrefix} VideoFrameFinder:`;
   }
-
+  
   #currentTimestamp = 0; // Timestamp of the last requested frame (microseconds)
   #currentAborter = { abort: false, startTime: performance.now() }; // Aborter for ongoing find operation
-
   /**
    * Finds and returns a VideoFrame for the specified time.
    * @param time - The target time in microseconds.
@@ -1537,6 +1536,11 @@ function createAudioChunksDecoder(
 // 并行执行任务，但按顺序emit结果
 // REFACTOR-IDEA: `createPromiseQueue` is a generic utility. If used elsewhere,
 // it could be moved to a more general utility module.
+/**
+ * Creates a queue that executes asynchronous tasks and emits their results in order.
+ * @param onResult - Callback function to handle each result.
+ * @returns A function to add new tasks to the queue.
+ */
 function createPromiseQueue<T extends any>(onResult: (data: T) => void) {
   const resultsCache: T[] = []; // Cache for results, indexed by their add order
   let waitingIndex = 0; // Index of the next result to emit
@@ -1585,6 +1589,7 @@ function emitAudioFrames(
   // REFACTOR-IDEA: The `emitAudioFrames` function creates new Float32Arrays for output.
   // For performance-critical applications, consider a pool of reusable buffers or allowing
   // the caller to provide output buffers to minimize allocations and garbage collection.
+  // todo: perf - Consider reusing memory space for audio arrays instead of creating new ones each time
   const audioOutput = [
     new Float32Array(emitFrameCount),
     new Float32Array(emitFrameCount),
@@ -1638,11 +1643,9 @@ async function videoSamplesToEncodedChunks(
   const firstSample = samples[0];
   const lastSample = samples.at(-1);
   if (lastSample == null) return []; // No samples to convert
-
   // Calculate total size of data range for these samples
   const rangeSize =
     lastSample.offset + lastSample.size - firstSample.offset;
-
   // If total size is less than 30MB, read all data in one go to reduce I/O operations
   if (rangeSize < 30e6) {
     const data = new Uint8Array(
@@ -1919,9 +1922,7 @@ async function thumbnailByKeyFrame(
     onOutput(null, true); // Signal completion if no chunks or aborted
     return;
   }
-
   let outputCount = 0; // Counter for output frames
-
   // Function to create and configure a VideoDecoder for thumbnails
   function createThumbnailDecoder(useSoftwareFallback = false) {
     const currentDecoderConfig = {
@@ -2063,4 +2064,3 @@ function memoryUsageInfo(): object {
     return {}; // Return empty if API access fails
   }
 }
-```

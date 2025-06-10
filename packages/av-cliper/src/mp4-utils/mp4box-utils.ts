@@ -24,6 +24,8 @@ import { file } from 'opfs-tools';
 export function extractFileConfig(file: MP4File, info: MP4Info) {
   // Get the first video track from the MP4 info.
   const vTrack = info.videoTracks[0];
+  // TODO-REFACTOR: The variable name 'rs' is generic. Consider renaming to something more descriptive
+  // like 'trackConfigsBundle' or 'mediaDecoderConfigs'.
   const rs: {
     videoTrackConf?: VideoTrackOpts;
     videoDecoderConf?: Parameters<VideoDecoder['configure']>[0];
@@ -31,13 +33,19 @@ export function extractFileConfig(file: MP4File, info: MP4Info) {
     audioDecoderConf?: Parameters<AudioDecoder['configure']>[0];
   } = {};
 
-  // If a video track exists, process it.
+  // REFACTOR-IDEA: The logic for video and audio track processing is similar in structure.
+  // If support for more track types (e.g., subtitles, metadata) were to be added in the future,
+  // consider abstracting the common parts of track processing into a generic function
+  // or using a strategy pattern to handle different track types more uniformly.
   if (vTrack != null) {
     // The 'description' for the VideoDecoder is a binary blob (avcC, hvcC, etc.)
     // that contains essential initialization parameters for the codec.
     const videoDesc = parseVideoCodecDesc(file.getTrackById(vTrack.id)).buffer;
 
     // Determine the key for the decoder configuration record based on the codec string.
+    // TODO-REFACTOR: The codec-specific key determination (avcDecoderConfigRecord vs. hevcDecoderConfigRecord)
+    // could be made more extensible, perhaps using a map or a more dynamic approach if more codecs
+    // requiring specific description keys are added.
     const { descKey, type } = vTrack.codec.startsWith('avc1') // H.264/AVC
       ? { descKey: 'avcDecoderConfigRecord', type: 'avc1' }
       : vTrack.codec.startsWith('hvc1') // H.265/HEVC
@@ -112,6 +120,13 @@ function parseVideoCodecDesc(track: TrakBoxParser): Uint8Array {
   // The description box is located inside the sample description ('stsd') box.
   for (const entry of track.mdia.minf.stbl.stsd.entries) {
     // The box can have different names depending on the codec (avcC, hvcC, etc.).
+    // TODO-REFACTOR: The use of `@ts-expect-error` suggests that the mp4box.js types might not fully
+    // cover all possible codec-specific entry types (like av1C, vpcC), or there's a need to access
+    // properties in a way not strictly defined by the current union type.
+    // This could be improved by:
+    // 1. Extending or refining mp4box.js type definitions if possible.
+    // 2. Using type assertions with caution if the structure is known and stable.
+    // 3. Adding a more robust type check or property existence check before access.
     // @ts-expect-error - Accessing non-standard properties on a union type.
     const box = entry.avcC ?? entry.hvcC ?? entry.av1C ?? entry.vpcC;
     if (box != null) {
@@ -155,6 +170,11 @@ function getESDSBoxFromMP4File(file: MP4File, codec = 'mp4a') {
  * @param esds - The 'esds' box parser object.
  * @returns An object with the correct sampleRate and numberOfChannels.
  */
+// TODO-REFACTOR: `parseAudioInfo4ESDSBox` involves direct binary parsing of the ESDS box
+// and uses a hardcoded `sampleRateEnum`. This is specific to AAC.
+// If other audio codecs require similar deep parsing, this logic might need to be
+// abstracted or handled by a more general-purpose ESDS parsing utility or per-codec handlers.
+// The hardcoded `sampleRateEnum` could also be defined as a constant elsewhere if used more broadly.
 function parseAudioInfo4ESDSBox(esds: ESDSBoxParser) {
   const decoderConf = esds.esd.descs[0]?.descs[0];
   if (decoderConf == null) return {};
@@ -188,6 +208,13 @@ function parseAudioInfo4ESDSBox(esds: ESDSBoxParser) {
  * @param onReady - A callback that fires once the 'moov' atom is parsed and file info is available.
  * @param onSamples - A callback that fires as the sample index is parsed, providing chunks of samples.
  */
+// REFACTOR-IDEA: `quickParseMP4File` uses callbacks (`onReady`, `onSamples`) for asynchronous operations.
+// This could potentially be refactored to use Promises for a more modern async/await flow,
+// perhaps by wrapping the mp4box.js event-driven API. This might make it easier to integrate
+// into larger async workflows.
+// TODO-REFACTOR: The `nbSamples` option in `setExtractionOptions` is hardcoded to 100.
+// This value might not be optimal for all scenarios (e.g., very short clips or clips with
+// very high sample rates). Consider making this configurable or dynamically adjusting it.
 export async function quickParseMP4File(
   reader: Awaited<ReturnType<ReturnType<typeof file>['createReader']>>,
   onReady: (data: { mp4boxFile: MP4File; info: MP4Info }) => void,

@@ -28,6 +28,8 @@ interface MP4DecoderConfig {
 }
 
 // Options for configuring an MP4Clip instance
+// TODO-REFACTOR: Consider consolidating MP4ClipOpts and MP4DecoderConfig, or nesting decoder configs within MP4ClipOpts
+// to have a single options object for the MP4Clip constructor.
 interface MP4ClipOpts {
   audio?: boolean | { volume: number }; // Audio processing options (enable/disable or set volume)
   /**
@@ -71,6 +73,8 @@ type ThumbnailOpts = {
  * @see [AVCanvas](../../av-canvas/classes/AVCanvas.html) - For rendering clips on a canvas.
  * @see [Decode and Play Video (Demo)](https://webav-tech.github.io/WebAV/demo/1_1-decode-video)
  */
+// REFACTOR-IDEA: The MP4Clip class is quite large. Consider if VideoFrameFinder and AudioFrameFinder
+// could be moved to separate files to improve modularity and readability of mp4-clip.ts.
 export class MP4Clip implements IClip {
   // Unique instance ID for the clip
   #insId = CLIP_ID++;
@@ -312,6 +316,10 @@ export class MP4Clip implements IClip {
    * @returns A Promise that resolves to an array of objects, each containing a timestamp (`ts`) and an image Blob (`img`).
    * @throws Error if thumbnail generation is aborted.
    */
+  // TODO-REFACTOR: The `thumbnails` method has two strategies (fixed step vs. keyframes).
+  // This could be made more explicit, perhaps by different methods or a strategy pattern.
+  // Also, the `VideoFrameFinder` instance created here is temporary; consider if the main
+  // `this.#videoFrameFinder` could be enhanced for different "modes" of seeking (e.g., fast seek for thumbnails).
   async thumbnails(
     imgWidth = 100,
     opts?: Partial<ThumbnailOpts>,
@@ -418,6 +426,11 @@ export class MP4Clip implements IClip {
    * @returns A Promise that resolves to an array containing two new MP4Clip instances.
    * @throws Error if the time is out of bounds (less than or equal to 0, or greater than or equal to duration).
    */
+  // TODO-REFACTOR: The `split` and `splitTrack` methods create new MP4Clip instances that share
+  // the `localFile` and `decoderConfig`. This is efficient but means changes to the underlying
+  // file or assumptions based on the original config could affect cloned/split clips.
+  // Consider if an option for "deep cloning" or more isolated state would be beneficial for some use cases,
+  // though it would come with performance/memory costs.
   async split(time: number): Promise<[this, this]> {
     await this.ready; // Ensure the clip is ready
 
@@ -615,6 +628,9 @@ function genMeta(
  * @param logPrefix - Prefix for console logging.
  * @returns An object containing the initialized VideoFrameFinder and AudioFrameFinder (or null if not applicable).
  */
+// TODO-REFACTOR: `genDecoder` is a factory for VideoFrameFinder and AudioFrameFinder.
+// The parameters (localFileReader, samples, config, logPrefix) are common.
+// Consider if the finders could share more logic or if their construction could be less verbose.
 function genDecoder(
   decoderConfig: MP4DecoderConfig,
   localFileReader: LocalFileReader,
@@ -661,6 +677,13 @@ function genDecoder(
  * @returns A Promise that resolves with an object containing videoSamples, audioSamples, decoderConf, and headerBoxPos.
  * @throws Error if the stream parsing completes but no metadata (mp4Info) is emitted, or if no samples are found.
  */
+// REFACTOR-IDEA: The callback-based nature of `quickParseMP4File` makes `mp4FileToSamples` flow
+// somewhat complex with variables (`mp4Info`, `decoderConfig`, etc.) being mutated in callbacks.
+// If `quickParseMP4File` could be promisified or refactored to return all data at once,
+// this function's structure could be simplified using async/await more directly.
+// TODO-REFACTOR: `mp4FileToSamples` does multiple things: MP4 parsing, sample extraction,
+// config extraction, and sample normalization. Consider breaking these into smaller,
+// more focused functions for better separation of concerns.
 async function mp4FileToSamples(
   opfsToolsFile: OPFSToolFile,
   opts: MP4ClipOpts = {},
@@ -755,6 +778,9 @@ async function mp4FileToSamples(
    * and adjusts them by a delta to make the first sample's DTS close to zero.
    * Also identifies IDR frames and handles potential NALU offsets for AVC/HEVC.
    */
+  // TODO-REFACTOR: The NALU offset logic in `normalizeTimescale` is codec-specific (H.264/H.265).
+  // If more codecs are supported in the future, this could be refactored, possibly using a
+  // strategy pattern or per-codec helper functions to handle such details.
   function normalizeTimescale(
     sample: MP4Sample,
     delta = 0,
@@ -795,6 +821,15 @@ async function mp4FileToSamples(
  * It efficiently seeks to the requested time, decodes a Group of Pictures (GoP),
  * and provides the target VideoFrame.
  */
+// TODO-REFACTOR: The state management in VideoFrameFinder (e.g., #currentTimestamp, #isDecodingInProgress, #useSoftwareDecoding)
+// could be encapsulated into a more formal state machine pattern to handle transitions between states like
+// 'idle', 'decoding', 'seeking', 'error', 'softwareFallback' more robustly.
+// TODO-REFACTOR: Error handling in `VideoFrameFinder` (e.g., in `#reset` or `#startDecode`) could be more structured.
+// For instance, defining specific error types or using a retry policy for certain recoverable errors.
+// TODO-REFACTOR: The constructor of `VideoFrameFinder` takes multiple individual parameters.
+// Consider using a single options object for better readability and extensibility if more params are added.
+// REFACTOR-IDEA: Parts of the `find` or `#parseFrame` methods in `VideoFrameFinder` are quite complex.
+// They could potentially be broken down into smaller, more manageable helper methods to improve clarity.
 class VideoFrameFinder {
   #decoder: VideoDecoder | null = null; // The VideoDecoder instance
   #logPrefix: string; // Prefix for console logging
@@ -807,10 +842,9 @@ class VideoFrameFinder {
   ) {
     this.#logPrefix = `${logPrefix} VideoFrameFinder:`;
   }
-
+  
   #currentTimestamp = 0; // Timestamp of the last requested frame (microseconds)
   #currentAborter = { abort: false, startTime: performance.now() }; // Aborter for ongoing find operation
-
   /**
    * Finds and returns a VideoFrame for the specified time.
    * @param time - The target time in microseconds.
@@ -1149,6 +1183,11 @@ function findIndexOfSamples(time: number, samples: ExtMP4Sample[]): number {
  * It efficiently seeks to the requested time, decodes audio chunks,
  * and provides PCM data.
  */
+// TODO-REFACTOR: Similar to VideoFrameFinder, `AudioFrameFinder` state management (`#currentTimestamp`, `#decodeCursorIndex`)
+// could be more formalized. Error handling and constructor parameters also follow similar patterns
+// and could benefit from the same refactoring considerations (state machine, structured errors, options object).
+// REFACTOR-IDEA: `AudioFrameFinder`'s `#parseFrame` logic for handling buffer shortages and decoder state
+// could be extracted or simplified for better readability.
 class AudioFrameFinder {
   #volume = 1; // Audio volume (0.0 to 1.0)
   #targetSampleRate; // Target sample rate for output PCM data
@@ -1494,6 +1533,9 @@ function createAudioChunksDecoder(
   };
 }
 
+// 并行执行任务，但按顺序emit结果
+// REFACTOR-IDEA: `createPromiseQueue` is a generic utility. If used elsewhere,
+// it could be moved to a more general utility module.
 /**
  * Creates a queue that executes asynchronous tasks and emits their results in order.
  * @param onResult - Callback function to handle each result.
@@ -1543,6 +1585,10 @@ function emitAudioFrames(
   },
   emitFrameCount: number,
 ): [Float32Array, Float32Array] {
+  // todo: perf 重复利用内存空间
+  // REFACTOR-IDEA: The `emitAudioFrames` function creates new Float32Arrays for output.
+  // For performance-critical applications, consider a pool of reusable buffers or allowing
+  // the caller to provide output buffers to minimize allocations and garbage collection.
   // todo: perf - Consider reusing memory space for audio arrays instead of creating new ones each time
   const audioOutput = [
     new Float32Array(emitFrameCount),
@@ -1597,11 +1643,9 @@ async function videoSamplesToEncodedChunks(
   const firstSample = samples[0];
   const lastSample = samples.at(-1);
   if (lastSample == null) return []; // No samples to convert
-
   // Calculate total size of data range for these samples
   const rangeSize =
     lastSample.offset + lastSample.size - firstSample.offset;
-
   // If total size is less than 30MB, read all data in one go to reduce I/O operations
   if (rangeSize < 30e6) {
     const data = new Uint8Array(
@@ -1878,9 +1922,7 @@ async function thumbnailByKeyFrame(
     onOutput(null, true); // Signal completion if no chunks or aborted
     return;
   }
-
   let outputCount = 0; // Counter for output frames
-
   // Function to create and configure a VideoDecoder for thumbnails
   function createThumbnailDecoder(useSoftwareFallback = false) {
     const currentDecoderConfig = {
@@ -2022,4 +2064,3 @@ function memoryUsageInfo(): object {
     return {}; // Return empty if API access fails
   }
 }
-```

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Split Video Demo</title>
+</head>
+<body>
+  <h1>Split Video Demo</h1>
+  <input type="file" id="fileInput" accept="video/mp4">
+  <button id="processButton">Process and Split Video</button>
+  <p id="status">Select a file and click "Process and Split Video"</p>
+
+  <h2>First Part</h2>
+  <video id="outputVideo1" controls></video>
+
+  <h2>Second Part</h2>
+  <video id="outputVideo2" controls></video>
+
+  <script type="module">
+    import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
+    import { tmpfile, write } from 'opfs-tools'; // Added import for opfs-tools
+
+    // ... (createFileWriter function remains the same) ...
+    async function createFileWriter(extName, suggestedNamePrefix = 'WebAV-export') {
+      const fileHandle = await window.showSaveFilePicker({
+        suggestedName: `${suggestedNamePrefix}-${Date.now()}.${extName}`,
+      });
+      return fileHandle.createWritable();
+    }
+
+    document.getElementById('processButton').addEventListener('click', async () => {
+      const fileInput = document.getElementById('fileInput');
+      const status = document.getElementById('status');
+      // Video elements for direct playback are not directly used with showSaveFilePicker output
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        status.textContent = 'No file selected';
+        return;
+      }
+
+      const uploadedFile = fileInput.files[0];
+      status.textContent = 'Processing file...';
+
+      let clip; // MP4Clip instance
+      let clipsToDestroy = []; // For managing created clips that need cleanup
+
+      try {
+        status.textContent = 'Writing file to temporary storage...';
+        const tempFile = tmpfile(); // Create OPFS temp file
+        const fileStream = uploadedFile.stream();
+        await write(tempFile, fileStream); // Write uploaded file to OPFS temp file
+        status.textContent = 'Temporary file created. Creating clip...';
+
+        clip = new MP4Clip(tempFile, { audio: true }); // Use OPFS tempFile
+        // Note: 'clip' is added to clipsToDestroy later if its destruction is managed by the array.
+        // However, the original code destroys 'clip' separately in finally.
+        // For consistency, if 'clip' itself is an MP4Clip that should be destroyed,
+        // it could be added to clipsToDestroy, or handled as is.
+
+        await clip.ready;
+        status.textContent = 'Clip ready. Splitting video at 5 seconds...';
+
+        // Split the video at 5 seconds (5e6 microseconds)
+        const splitPoint = 5e6;
+        const [part1Clip, part2Clip] = await clip.split(splitPoint);
+        clipsToDestroy.push(part1Clip, part2Clip);
+
+        await part1Clip.ready;
+        await part2Clip.ready;
+        status.textContent = 'Video split. Processing part 1...';
+
+        // Process and save the first part
+        const combinator1 = new Combinator({
+          width: part1Clip.meta.width || 1280,
+          height: part1Clip.meta.height || 720,
+          audio: {
+            sampleRate: part1Clip.meta.audioSampleRate || 44100,
+            channelCount: part1Clip.meta.audioChannelCount || 2,
+            codec: 'aac',
+          }
+        });
+        const sprite1 = new OffscreenSprite(part1Clip);
+        await combinator1.addSprite(sprite1);
+        let stream1 = combinator1.output();
+        let writableStream1 = await createFileWriter('mp4', 'Part1');
+        await stream1.pipeTo(writableStream1);
+        status.textContent = 'Part 1 saved. Processing part 2...';
+        combinator1.destroy(); // Destroy combinator1 after use
+
+
+        // Process and save the second part
+        const combinator2 = new Combinator({
+          width: part2Clip.meta.width || 1280,
+          height: part2Clip.meta.height || 720,
+          audio: {
+            sampleRate: part2Clip.meta.audioSampleRate || 44100,
+            channelCount: part2Clip.meta.audioChannelCount || 2,
+            codec: 'aac',
+          }
+        });
+        const sprite2 = new OffscreenSprite(part2Clip);
+        await combinator2.addSprite(sprite2);
+        let stream2 = combinator2.output();
+        let writableStream2 = await createFileWriter('mp4', 'Part2');
+        await stream2.pipeTo(writableStream2);
+        combinator2.destroy(); // Destroy combinator2 after use
+
+        status.textContent = 'Both parts processed and saved successfully!';
+
+        // Direct playback in <video> tags is not implemented here due to showSaveFilePicker limitations.
+        // Users would typically download the files and play them locally.
+
+      } catch (error) {
+        console.error('Error splitting video:', error);
+        status.textContent = 'Error: ' + error.message;
+      } finally {
+        // Cleanup all clips
+        if (clip) clip.destroy();
+        clipsToDestroy.forEach(c => c.destroy());
+      }
+    });
+  </script>
+</body>
+</html>

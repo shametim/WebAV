@@ -12,7 +12,9 @@ import * as waveResampler from 'wave-resampler';
  */
 export function concatFloat32Array(buffers: Float32Array[]): Float32Array {
   // Calculate the total length of the resulting array.
-  const totalLength = buffers.map((buf) => buf.length).reduce((a, b) => a + b, 0);
+  const totalLength = buffers
+    .map((buf) => buf.length)
+    .reduce((a, b) => a + b, 0);
   const resultArray = new Float32Array(totalLength);
 
   let offset = 0;
@@ -73,15 +75,25 @@ export function extractPCM4AudioData(audioData: AudioData): Float32Array[] {
   }
   // Handle 'f32' format (Float32, interleaved channels).
   else if (audioData.format === 'f32') {
-    const interleavedBuffer = new ArrayBuffer(audioData.allocationSize({ planeIndex: 0 }));
+    const interleavedBuffer = new ArrayBuffer(
+      audioData.allocationSize({ planeIndex: 0 }),
+    );
     audioData.copyTo(interleavedBuffer, { planeIndex: 0 });
-    return convertF32ToPlanar(new Float32Array(interleavedBuffer), audioData.numberOfChannels);
+    return convertF32ToPlanar(
+      new Float32Array(interleavedBuffer),
+      audioData.numberOfChannels,
+    );
   }
   // Handle 's16' format (Signed 16-bit integer, interleaved channels).
   else if (audioData.format === 's16') {
-    const interleavedS16Buffer = new ArrayBuffer(audioData.allocationSize({ planeIndex: 0 }));
+    const interleavedS16Buffer = new ArrayBuffer(
+      audioData.allocationSize({ planeIndex: 0 }),
+    );
     audioData.copyTo(interleavedS16Buffer, { planeIndex: 0 });
-    return convertS16ToF32Planar(new Int16Array(interleavedS16Buffer), audioData.numberOfChannels);
+    return convertS16ToF32Planar(
+      new Int16Array(interleavedS16Buffer),
+      audioData.numberOfChannels,
+    );
   }
   // Throw an error for unsupported formats.
   throw Error('Unsupported audio data format');
@@ -94,7 +106,10 @@ export function extractPCM4AudioData(audioData: AudioData): Float32Array[] {
  * @param numChannels - The number of audio channels.
  * @returns An array of Float32Arrays, each containing the audio data for one channel, normalized to the range [-1.0, 1.0].
  */
-function convertS16ToF32Planar(pcmSigned16BitData: Int16Array, numChannels: number): Float32Array[] {
+function convertS16ToF32Planar(
+  pcmSigned16BitData: Int16Array,
+  numChannels: number,
+): Float32Array[] {
   const numSamples = pcmSigned16BitData.length / numChannels;
   const planarData = Array.from(
     { length: numChannels },
@@ -119,7 +134,10 @@ function convertS16ToF32Planar(pcmSigned16BitData: Int16Array, numChannels: numb
  * @param numChannels - The number of audio channels.
  * @returns An array of Float32Arrays, each containing the audio data for one channel.
  */
-function convertF32ToPlanar(pcmF32Data: Float32Array, numChannels: number): Float32Array[] {
+function convertF32ToPlanar(
+  pcmF32Data: Float32Array,
+  numChannels: number,
+): Float32Array[] {
   const numSamples = pcmF32Data.length / numChannels;
   const planarData = Array.from(
     { length: numChannels },
@@ -141,7 +159,9 @@ function convertF32ToPlanar(pcmF32Data: Float32Array, numChannels: number): Floa
  * @param audioBuffer - The AudioBuffer from which to extract PCM data.
  * @returns An array of Float32Arrays, where each Float32Array contains the PCM data for one audio channel.
  */
-export function extractPCM4AudioBuffer(audioBuffer: AudioBuffer): Float32Array[] {
+export function extractPCM4AudioBuffer(
+  audioBuffer: AudioBuffer,
+): Float32Array[] {
   // Create an array with the length of numberOfChannels and map over it.
   return Array(audioBuffer.numberOfChannels)
     .fill(0)
@@ -158,7 +178,10 @@ export function extractPCM4AudioBuffer(audioBuffer: AudioBuffer): Float32Array[]
  * @param volume - The volume adjustment factor (0.0 to 1.0, where 1.0 is original volume).
  * @returns A new AudioData object with the adjusted volume. The original AudioData object is closed.
  */
-export function adjustAudioDataVolume(audioData: AudioData, volume: number): AudioData {
+export function adjustAudioDataVolume(
+  audioData: AudioData,
+  volume: number,
+): AudioData {
   // Extract PCM data, apply volume adjustment, and create a new Float32Array.
   const adjustedPCMData = new Float32Array(
     concatFloat32Array(extractPCM4AudioData(audioData)),
@@ -245,7 +268,9 @@ export async function decodeImg(
  */
 export function mixinPCM(audios: Float32Array[][]): Float32Array {
   // Determine the maximum length among all first channels (left channels) of the audio tracks.
-  const maxLen = Math.max(...audios.map((audioTrack) => audioTrack[0]?.length ?? 0));
+  const maxLen = Math.max(
+    ...audios.map((audioTrack) => audioTrack[0]?.length ?? 0),
+  );
   // Create a Float32Array to hold the mixed data. Size is maxLen * 2 for stereo (L and R channels).
   const mixedData = new Float32Array(maxLen * 2);
 
@@ -260,7 +285,8 @@ export function mixinPCM(audios: Float32Array[][]): Float32Array {
       const trackChannel0Sample = audios[trackIndex][0]?.[sampleIndex] ?? 0;
       // Get sample from channel 1 (right) of the current track.
       // If channel 1 doesn't exist or the sample is undefined, duplicate channel 0's sample.
-      const trackChannel1Sample = audios[trackIndex][1]?.[sampleIndex] ?? trackChannel0Sample;
+      const trackChannel1Sample =
+        audios[trackIndex][1]?.[sampleIndex] ?? trackChannel0Sample;
 
       mixedChannel0Sample += trackChannel0Sample;
       mixedChannel1Sample += trackChannel1Sample;
@@ -332,7 +358,11 @@ export async function audioResample(
   );
   const audioBufferSource = offlineCtx.createBufferSource();
   // Create an AudioBuffer with the original channel count, length, and sample rate.
-  const audioBuffer = offlineCtx.createBuffer(channelCount, maxLength, currentRate);
+  const audioBuffer = offlineCtx.createBuffer(
+    channelCount,
+    maxLength,
+    currentRate,
+  );
   // Copy PCM data from input arrays to the channels of the AudioBuffer.
   pcmData.forEach((data, index) => audioBuffer.copyToChannel(data, index));
 
@@ -359,7 +389,7 @@ export function sleep(time: number): Promise<void> {
     // Use workerTimer to ensure the timer works reliably even in background tabs.
     const stopTimer = workerTimer(() => {
       stopTimer(); // Stop the timer itself.
-      resolve();   // Resolve the promise.
+      resolve(); // Resolve the promise.
     }, time);
   });
 }
@@ -434,4 +464,3 @@ export function changePCMPlaybackRate(
 
   return newPcmData;
 }
-```

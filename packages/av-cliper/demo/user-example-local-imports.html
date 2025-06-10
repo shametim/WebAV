@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Extract and Export First 10 Seconds (Local Imports)</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+    }
+
+    #fileInput {
+      margin-bottom: 10px;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Upload an MP4 File and Extract/Export First 10 Seconds (Local Imports)</h1>
+  <input type="file" id="fileInput" accept="video/mp4">
+  <p id="status">Select a file to process...</p>
+
+  <script type="module">
+    // Imports from local src and opfs-tools
+    import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
+    import { tmpfile, write } from 'opfs-tools';
+
+    // Independent function for creating a file writer (same as original example)
+    async function createFileWriter(extName) {
+      const fileHandle = await window.showSaveFilePicker({
+        suggestedName: `WebAV-export-${Date.now()}.${extName}`,
+      });
+      return fileHandle.createWritable();
+    }
+
+    async function extractAndExportFirst10Seconds() {
+      const fileInput = document.getElementById('fileInput');
+      const status = document.getElementById('status');
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        status.textContent = 'No file selected';
+        return;
+      }
+
+      const uploadedFile = fileInput.files[0];
+      status.textContent = 'Processing file...';
+
+      let originalClip; // To hold the main MP4Clip instance for cleanup
+      let first10SecondsClip; // To hold the split clip for cleanup
+      let combinator; // To hold the Combinator instance for cleanup
+
+
+      try {
+        status.textContent = 'Writing file to temporary storage...';
+        const tempFile = tmpfile(); // Create OPFS temp file
+        const fileStream = uploadedFile.stream();
+        await write(tempFile, fileStream); // Write the stream to OPFS temp file
+        status.textContent = 'Temporary file created. Creating clip...';
+
+        originalClip = new MP4Clip(tempFile, { audio: true }); // Pass temp file, audio enabled
+        await originalClip.ready;
+        console.log('Clip metadata:', originalClip.meta);
+        status.textContent = 'Clip loaded. Splitting...';
+
+        // Split at 10 seconds (10e6 microseconds)
+        // The example used 55e6, which is 55 seconds. Assuming 10 seconds was intended by the title.
+        // Using 10e6 for 10 seconds.
+        ([first10SecondsClip] = await originalClip.split(10e6));
+        await first10SecondsClip.ready;
+        status.textContent = 'Clip split. Exporting...';
+
+        const clipMeta = first10SecondsClip.meta;
+        console.log('First 10s clip meta:', clipMeta);
+
+        const combinatorOptions = {
+          width: clipMeta.width || 1280,
+          height: clipMeta.height || 720,
+          bgColor: '#000000',
+          bitrate: 1_000_000, // 1 Mbps
+          audio: { // Ensure audio configuration is present
+            sampleRate: clipMeta.audioSampleRate || 16000, // Default or from clip
+            channelCount: clipMeta.audioChannelCount || 2, // Default or from clip
+            codec: 'aac',
+          }
+        };
+        console.log('Combinator options:', combinatorOptions);
+
+        combinator = new Combinator(combinatorOptions);
+        const offscreenSprite = new OffscreenSprite(first10SecondsClip);
+        // Note: OffscreenSprite does not need to be explicitly destroyed if it's managed by Combinator
+        // or if its underlying clip (first10SecondsClip) is destroyed.
+        await combinator.addSprite(offscreenSprite);
+
+        const outputStream = combinator.output();
+        const writableStream = await createFileWriter('mp4');
+        await outputStream.pipeTo(writableStream);
+
+        status.textContent = 'First 10 seconds exported successfully!';
+
+      } catch (error) {
+        console.error('Error details:', error);
+        status.textContent = 'Error: ' + error.message;
+      } finally {
+        // Cleanup resources
+        if (first10SecondsClip) first10SecondsClip.destroy();
+        if (originalClip) originalClip.destroy();
+        if (combinator) combinator.destroy();
+      }
+    }
+
+    document.getElementById('fileInput').addEventListener('change', extractAndExportFirst10Seconds);
+  </script>
+</body>
+</html>

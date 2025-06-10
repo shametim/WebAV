@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clip Video Demo</title>
+</head>
+<body>
+  <h1>Clip Video Demo</h1>
+  <input type="file" id="fileInput" accept="video/mp4">
+  <button id="processButton">Process Video</button>
+  <p id="status">Select a file and click "Process Video"</p>
+  <video id="outputVideo" controls></video>
+
+  <script type="module">
+    import { MP4Clip, Combinator, OffscreenSprite } from '../src/index.ts';
+    import { tmpfile, write } from 'opfs-tools'; // Added import for opfs-tools
+
+    // ... (createFileWriter function remains the same) ...
+    async function createFileWriter(extName) {
+      const fileHandle = await window.showSaveFilePicker({
+        suggestedName: `WebAV-export-${Date.now()}.${extName}`,
+      });
+      return fileHandle.createWritable();
+    }
+
+    document.getElementById('processButton').addEventListener('click', async () => {
+      const fileInput = document.getElementById('fileInput');
+      const status = document.getElementById('status');
+      // const outputVideo = document.getElementById('outputVideo'); // Output video display is not directly implemented
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        status.textContent = 'No file selected';
+        return;
+      }
+
+      const uploadedFile = fileInput.files[0]; // Renamed from inputFile for clarity
+      status.textContent = 'Processing file...';
+
+      try {
+        status.textContent = 'Writing file to temporary storage...';
+        const tempFile = tmpfile(); // Create OPFS temp file
+        const fileStream = uploadedFile.stream();
+        await write(tempFile, fileStream); // Write uploaded file to OPFS temp file
+        status.textContent = 'Temporary file created. Creating clip...';
+
+        const clip = new MP4Clip(tempFile, { audio: false }); // Use OPFS tempFile
+        await clip.ready;
+        status.textContent = 'Clip ready. Clipping first 5 seconds...';
+
+        const [first5Seconds] = await clip.split(5e6); // 5 seconds in microseconds
+        await first5Seconds.ready;
+        status.textContent = 'Clipped. Combining and rendering...';
+
+        const combinator = new Combinator({
+          width: first5Seconds.meta.width || 1280,
+          height: first5Seconds.meta.height || 720,
+        });
+
+        const sprite = new OffscreenSprite(first5Seconds);
+        await combinator.addSprite(sprite);
+
+        const stream = combinator.output();
+        const writableStream = await createFileWriter('mp4');
+        await stream.pipeTo(writableStream);
+        status.textContent = 'Video processed and saved.';
+
+        // Cleanup
+        clip.destroy();
+        first5Seconds.destroy();
+        combinator.destroy();
+
+      } catch (error) {
+        console.error('Error processing video:', error);
+        status.textContent = 'Error: ' + error.message;
+      }
+    });
+  </script>
+</body>
+</html>

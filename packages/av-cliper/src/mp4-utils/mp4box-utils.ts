@@ -224,34 +224,44 @@ export async function quickParseMP4File(
     const rawVideoSamples: MP4Sample[] = [];
     const rawAudioSamples: MP4Sample[] = [];
 
+    // Keep track of expected samples, though nb_samples in onReady might not be final
+    // if the file is still being parsed. The onFlush mechanism is more robust.
+    // let totalVideoSamplesExpected = 0;
+    // let totalAudioSamplesExpected = 0;
+
     mp4boxFile.onReady = (info) => {
       mp4Info = info;
+      // console.log('MP4Box ready:', info);
 
+      // It's generally recommended to set extraction options in onReady
       const vTrackId = info.videoTracks[0]?.id;
       if (vTrackId != null) {
+        // totalVideoSamplesExpected = info.videoTracks[0].nb_samples;
         mp4boxFile.setExtractionOptions(vTrackId, 'video', { nbSamples: 100 });
       }
 
       const aTrackId = info.audioTracks[0]?.id;
       if (aTrackId != null) {
+        // totalAudioSamplesExpected = info.audioTracks[0].nb_samples;
         mp4boxFile.setExtractionOptions(aTrackId, 'audio', { nbSamples: 100 });
       }
       // Start the extraction process after setting options.
       mp4boxFile.start();
     };
 
-    mp4boxFile.onSamples = (id, user, samples) => {
-      // Based on track_id, determine if it's video or audio
-      // This assumes a simple mapping; might need adjustment if track IDs are not standard
+    mp4boxFile.onSamples = (id, _user, samples) => {
+      if (samples.length === 0) return;
       const track = mp4boxFile.getTrackById(id);
       if (track.type === 'video') {
         rawVideoSamples.push(...samples);
       } else if (track.type === 'audio') {
         rawAudioSamples.push(...samples);
       }
+      // console.log(`Received ${samples.length} ${track.type} samples. Total video: ${rawVideoSamples.length}, Total audio: ${rawAudioSamples.length}`);
     };
 
     mp4boxFile.onError = (e: any) => {
+      // console.error('MP4Box error:', e);
       reject(new Error(`MP4Box parsing error: ${e}`));
     };
 
@@ -268,32 +278,60 @@ export async function quickParseMP4File(
 
           if (data.byteLength === 0) {
             // End of file
+            // console.log('Reached end of file stream. Flushing mp4box.');
+
+            mp4boxFile.onFlush = () => {
+              // console.log('MP4Box flushed.');
+              if (mp4boxFile.inputBufferRemaining() > 0) {
+                // This case should ideally not happen if flush is synchronous and processes all.
+                // console.warn('MP4Box still has remaining input buffer after flush. This might indicate an issue.');
+                // We might need to call flush again or wait, but typically onFlush means it's done with current buffer.
+              }
+
+              if (mp4Info == null) {
+                // console.error('MP4 parsing finished (onFlush) but mp4Info is null.');
+                reject(
+                  new Error(
+                    'MP4 parsing finished (onFlush) but mp4Info is null.',
+                  ),
+                );
+                return;
+              }
+
+              // At this point, onSamples should have been called for all data.
+              // We can double-check against mp4Info.videoTracks[0].nb_samples if needed,
+              // but onFlush is the primary gate.
+              // console.log(`Flushed. Video samples: ${rawVideoSamples.length}/${totalVideoSamplesExpected}, Audio samples: ${rawAudioSamples.length}/${totalAudioSamplesExpected}`);
+
+              mp4boxFile.stop(); // Finalize parsing.
+              // console.log('MP4Box stopped. Resolving promise.');
+              resolve({
+                mp4Info,
+                rawVideoSamples,
+                rawAudioSamples,
+                mp4boxFile,
+              });
+            };
+
             mp4boxFile.flush(); // Ensure all data is processed
-            mp4boxFile.stop();  // Finalize parsing
-            if (mp4Info == null) {
-              reject(new Error('MP4 parsing finished but mp4Info is null.'));
-              return;
-            }
-            resolve({
-              mp4Info,
-              rawVideoSamples,
-              rawAudioSamples,
-              mp4boxFile,
-            });
-            break;
+            break; // Exit the read loop
           }
 
           data.fileStart = cursor;
           const nextPos = mp4boxFile.appendBuffer(data);
+          // console.log(`Appended buffer. fileStart: ${data.fileStart}, size: ${data.byteLength}, next read offset: ${nextPos}`);
 
-          if (nextPos == null) {
-            // mp4box sometimes returns null when it has enough data for 'moov' but before EOF.
-            // We should continue reading until EOF to get all samples.
-            // The final resolve will happen when data.byteLength === 0.
-          }
-          cursor = nextPos ?? cursor + data.byteLength; // Advance cursor even if nextPos is null due to partial parse
+          // mp4box.js might return `current_parse_offset` which could be less than `data.fileStart + data.byteLength`
+          // if it hasn't processed the entire buffer yet (e.g. waiting for more data to complete an atom).
+          // The `nextPos` here is the offset in the file where mp4box suggests the next read should start.
+          // If `nextPos` is returned as the same as `cursor` after appending data, it implies mp4box
+          // needs more data to complete the current atom and `appendBuffer` will be called again with
+          // more data starting from where it left off.
+          // If `nextPos` is advanced, it means mp4box has processed up to that point.
+          cursor = nextPos ?? cursor + data.byteLength;
         }
       } catch (err) {
+        // console.error('Error during parse loop:', err);
         reject(err);
       }
     }

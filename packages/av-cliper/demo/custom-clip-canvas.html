@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Clip from Canvas Animation</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #status { margin-top: 10px; }
+        canvas { border: 1px solid black; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Custom Clip from Canvas Animation</h1>
+    <p>This demo creates a short video (5 seconds) from a canvas animation.</p>
+    <button id="createVideoButton">Create and Download Video</button>
+    <p id="status">Ready</p>
+    <p>Preview of the animation (updated on demand):</p>
+    <canvas id="previewCanvas" width="640" height="360"></canvas>
+
+    <script type="module" src="custom-clip-canvas.ts"></script>
+    <script src="https://cdn.jsdelivr.net/npm/opfs-tools-explorer"></script>
+    <script>
+      OTExplorer.init();
+    </script>
+</body>
+</html>

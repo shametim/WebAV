@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Thumbnail Generation</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #thumbnailContainer { margin-top: 20px; display: flex; flex-wrap: wrap; gap: 10px; }
+        .thumbnail { width: 160px; height: 90px; border: 1px solid #ccc; object-fit: cover; }
+        #status { margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Video Thumbnail Generation</h1>
+    <p>Upload a video file to generate thumbnails.</p>
+    <input type="file" id="fileInput" accept="video/mp4,video/webm,video/ogg">
+    <p id="status">Select a video file.</p>
+    <div id="thumbnailContainer"></div>
+
+    <script type="module" src="video-thumbnails.ts"></script>
+</body>
+</html>

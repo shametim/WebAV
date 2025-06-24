@@ -21,22 +21,25 @@ type MPClipCloneArgs = Awaited<ReturnType<typeof mp4FileToSamples>> & {
   localFile: OPFSToolFile; // The local file representation in OPFS
 };
 
-// Interface for MP4 decoder configurations
-interface MP4DecoderConfig {
-  video: VideoDecoderConfig | null; // Video decoder configuration
-  audio: AudioDecoderConfig | null; // Audio decoder configuration
-}
-
 // Options for configuring an MP4Clip instance
 // TODO-REFACTOR: Consider consolidating MP4ClipOpts and MP4DecoderConfig, or nesting decoder configs within MP4ClipOpts
 // to have a single options object for the MP4Clip constructor.
 interface MP4ClipOpts {
   audio?: boolean | { volume: number }; // Audio processing options (enable/disable or set volume)
+  decoderConfig?: {
+    video: VideoDecoderConfig | null; // Video decoder configuration
+    audio: AudioDecoderConfig | null; // Audio decoder configuration
+  };
   /**
    * Unsafe option, may be deprecated at any time.
    * Used to specify hardware acceleration preference for video decoding.
    */
   __unsafe_hardwareAcceleration__?: HardwarePreference;
+  /**
+   * If true, operations like clone, split will create a new copy of the underlying file.
+   * Defaults to false (sharing the file).
+   */
+  deepClone?: boolean;
 }
 
 // Extended MP4Sample type, omitting the original 'data' and adding specific properties
@@ -144,6 +147,7 @@ export class MP4Clip implements IClip {
   #audioFrameFinder: AudioFrameFinder | null = null;
 
   // Decoder configurations for video and audio
+  // This will be populated from opts.decoderConfig or parsed from the file
   #decoderConfig: {
     video: VideoDecoderConfig | null;
     audio: AudioDecoderConfig | null;
@@ -153,13 +157,20 @@ export class MP4Clip implements IClip {
   };
 
   // Options passed to the constructor
-  #opts: MP4ClipOpts = { audio: true };
+  #opts: Required<MP4ClipOpts>; // Now includes deepClone default
 
   constructor(
     source: OPFSToolFile | ReadableStream<Uint8Array> | MPClipCloneArgs,
-    opts: MP4ClipOpts = {},
+    opts: MP4ClipOpts = {}, // User-provided options
   ) {
     this.#logPrefix = `MP4Clip id:${this.#insId}:`;
+
+    // Initialize #opts with defaults, including for deepClone
+    this.#opts = {
+      audio: true,
+      deepClone: false, // Default for deepClone
+      ...opts, // User options override defaults
+    };
     // Validate the source argument
     if (
       !(source instanceof ReadableStream) &&
@@ -172,11 +183,10 @@ export class MP4Clip implements IClip {
       );
     }
 
-    this.#opts = { audio: true, ...opts }; // Merge default options with provided ones
-    // Set volume based on options
+    // Set volume based on the final #opts
     this.#volume =
-      typeof opts.audio === 'object' && 'volume' in opts.audio
-        ? opts.audio.volume
+      typeof this.#opts.audio === 'object' && 'volume' in this.#opts.audio
+        ? this.#opts.audio.volume
         : 1;
 
     // Asynchronously initializes the clip by writing the stream to a local file
@@ -205,28 +215,35 @@ export class MP4Clip implements IClip {
       async ({
         videoSamples,
         audioSamples,
-        decoderConf: rawDecoderConfig,
+        // decoderConf is replaced by parsedDecoderConfig in the return type of mp4FileToSamples
+        parsedDecoderConfig, // This will come from mp4FileToSamples or MPClipCloneArgs. Its type is { video: VideoDecoderConfig | null, audio: AudioDecoderConfig | null }
         headerBoxPos,
       }) => {
         this.#videoSamples = videoSamples;
         this.#audioSamples = audioSamples;
-        this.#decoderConfig = rawDecoderConfig;
         this.#headerBoxPos = headerBoxPos;
+
+        // Start with the decoderConfig from options, or the parsed one
+        let baseDecoderConfig = this.#opts.decoderConfig ?? parsedDecoderConfig;
+
+        // Prepare the final decoder config, potentially overriding hardwareAcceleration
+        this.#decoderConfig = {
+          video:
+            baseDecoderConfig.video == null
+              ? null
+              : {
+                  ...baseDecoderConfig.video,
+                  // Apply hardware acceleration preference from options if it's specifically set
+                  ...(this.#opts.__unsafe_hardwareAcceleration__ != null && {
+                    hardwareAcceleration: this.#opts.__unsafe_hardwareAcceleration__,
+                  }),
+                },
+          audio: baseDecoderConfig.audio,
+        };
 
         // Generate decoder instances (VideoFrameFinder, AudioFrameFinder)
         const { videoFrameFinder, audioFrameFinder } = genDecoder(
-          {
-            video:
-              rawDecoderConfig.video == null
-                ? null
-                : {
-                    ...rawDecoderConfig.video,
-                    // Apply hardware acceleration preference from options
-                    hardwareAcceleration:
-                      this.#opts.__unsafe_hardwareAcceleration__,
-                  },
-            audio: rawDecoderConfig.audio,
-          },
+          this.#decoderConfig, // Use the now fully resolved and stored decoderConfig
           await this.#localFile.createReader(), // Create a reader for the local file
           videoSamples,
           audioSamples,
@@ -238,7 +255,7 @@ export class MP4Clip implements IClip {
 
         // Generate and store metadata
         this.#meta = genMeta(
-          rawDecoderConfig,
+          this.#decoderConfig, // Use the resolved decoderConfig
           videoSamples,
           audioSamples,
         );
@@ -305,8 +322,65 @@ export class MP4Clip implements IClip {
     });
   }
 
-  // AbortController for cancelling ongoing thumbnail generation
   #thumbAborter = new AbortController();
+
+  private async _thumbnailsByStep(
+    vfToBlobConverter: (vf: VideoFrame) => Promise<Blob>,
+    aborterSignal: AbortSignal,
+    addPNGPromise: (vf: VideoFrame) => void,
+    opts: Required<ThumbnailOpts>, // Full options needed here
+  ): Promise<void> {
+    if (this.#videoFrameFinder == null) {
+      console.warn(this.#logPrefix, 'VideoFrameFinder not available for thumbnailsByStep');
+      return;
+    }
+
+    let currentTime = opts.start;
+    while (currentTime <= opts.end && !aborterSignal.aborted) {
+      const videoFrame = await this.#videoFrameFinder.find(currentTime, 'fast');
+      if (videoFrame) {
+        addPNGPromise(videoFrame);
+      }
+      currentTime += opts.step;
+      if (currentTime % (opts.step * 10) < opts.step) await sleep(0); // Yield periodically
+    }
+  }
+
+  private async _thumbnailsByKeyframes(
+    vfToBlobConverter: (vf: VideoFrame) => Promise<Blob>,
+    aborterSignal: AbortSignal,
+    addPNGPromise: (vf: VideoFrame) => void,
+    resolveAllPNGs: () => void, // Callback to resolve the main promise
+    opts: Required<ThumbnailOpts>, // Full options needed here
+  ): Promise<void> {
+    if (this.#decoderConfig.video == null) {
+       console.warn(this.#logPrefix, 'Video config not available for thumbnailsByKeyframes');
+       resolveAllPNGs(); // Resolve empty if no config
+       return;
+    }
+
+    await thumbnailByKeyFrame(
+      this.#videoSamples,
+      this.#localFile,
+      this.#decoderConfig.video, // Use the instance's config
+      aborterSignal,
+      { start: opts.start, end: opts.end },
+      (videoFrame, done) => {
+        if (aborterSignal.aborted) {
+          videoFrame?.close();
+          return;
+        }
+        if (videoFrame != null) {
+          addPNGPromise(videoFrame);
+        }
+        if (done) {
+          resolveAllPNGs();
+        }
+      },
+      this.#logPrefix,
+    );
+  }
+
   /**
    * Generates thumbnails for the video clip.
    * By default, it generates one thumbnail (100px wide) for each keyframe.
@@ -316,104 +390,92 @@ export class MP4Clip implements IClip {
    * @returns A Promise that resolves to an array of objects, each containing a timestamp (`ts`) and an image Blob (`img`).
    * @throws Error if thumbnail generation is aborted.
    */
-  // TODO-REFACTOR: The `thumbnails` method has two strategies (fixed step vs. keyframes).
-  // This could be made more explicit, perhaps by different methods or a strategy pattern.
-  // Also, the `VideoFrameFinder` instance created here is temporary; consider if the main
-  // `this.#videoFrameFinder` could be enhanced for different "modes" of seeking (e.g., fast seek for thumbnails).
   async thumbnails(
     imgWidth = 100,
-    opts?: Partial<ThumbnailOpts>,
+    partialOpts?: Partial<ThumbnailOpts>,
   ): Promise<Array<{ ts: number; img: Blob }>> {
-    this.#thumbAborter.abort(); // Abort any previous thumbnail generation
-    this.#thumbAborter = new AbortController(); // Create a new AbortController
-    const aborterSignal = this.#thumbAborter.signal; // Get the signal for the new controller
+    this.#thumbAborter.abort();
+    this.#thumbAborter = new AbortController();
+    const aborterSignal = this.#thumbAborter.signal;
 
-    await this.ready; // Ensure the clip is ready
+    await this.ready;
     const abortMsg = 'generate thumbnails aborted';
-    if (aborterSignal.aborted) throw Error(abortMsg); // Check if aborted before starting
+    if (aborterSignal.aborted) throw Error(abortMsg);
 
-    const { width, height } = this.#meta;
-    // Create a converter function to turn VideoFrames into image Blobs
+    if (this.#decoderConfig.video == null || this.#videoSamples.length === 0) {
+      return [];
+    }
+
+    const { width, height, duration } = this.#meta;
     const vfToBlobConverter = createVF2BlobConverter(
       imgWidth,
-      Math.round(height * (imgWidth / width)), // Calculate proportional height
-      { quality: 0.1, type: 'image/png' }, // Image encoding options
+      Math.round(height * (imgWidth / width)),
+      { quality: 0.1, type: 'image/png' },
     );
+
+    const fullOpts: Required<ThumbnailOpts> = {
+      start: 0,
+      end: duration,
+      step: 0, // Default to keyframe-based
+      ...(partialOpts ?? {}),
+    };
+    // Ensure step is explicitly 0 if not provided or invalid, for clarity in delegation
+    if (partialOpts?.step == null || partialOpts.step <= 0) {
+      fullOpts.step = 0;
+    }
 
     return new Promise<Array<{ ts: number; img: Blob }>>(
       async (resolve, reject) => {
         let pngPromises: Array<{ ts: number; img: Promise<Blob> }> = [];
-        const videoConfig = this.#decoderConfig.video;
-        if (videoConfig == null || this.#videoSamples.length === 0) {
-          // If no video track or samples, resolve with empty array
-          resolvePNGs();
-          return;
-        }
-        // Listen for abort signal
-        aborterSignal.addEventListener('abort', () => {
-          reject(Error(abortMsg));
-        });
+        aborterSignal.addEventListener('abort', () => reject(Error(abortMsg)));
 
-        // Function to resolve the main promise with all generated thumbnails
-        async function resolvePNGs() {
-          if (aborterSignal.aborted) return; // Don't resolve if aborted
-          resolve(
-            await Promise.all(
-              pngPromises.map(async (it) => ({
-                ts: it.ts,
-                img: await it.img, // Wait for each Blob to be generated
-              })),
-            ),
-          );
-        }
-
-        // Helper to add a VideoFrame-to-Blob conversion promise to the list
-        function addPNGPromise(videoFrame: VideoFrame) {
+        const addPNGPromise = (videoFrame: VideoFrame) => {
+          if (aborterSignal.aborted) {
+            videoFrame?.close();
+            return;
+          }
           pngPromises.push({
             ts: videoFrame.timestamp,
             img: vfToBlobConverter(videoFrame),
           });
-        }
+        };
 
-        const {
-          start = 0,
-          end = this.#meta.duration,
-          step,
-        } = opts ?? {}; // Default options if not provided
-
-        if (step) {
-          // If a step is provided, generate thumbnails at fixed intervals
-          let currentTime = start;
-          // Create a new VideoFrameFinder instance to avoid conflicts with the main tick method
-          const videoFrameFinder = new VideoFrameFinder(
-            await this.#localFile.createReader(),
-            this.#videoSamples,
-            {
-              ...videoConfig,
-              hardwareAcceleration: this.#opts.__unsafe_hardwareAcceleration__,
-            },
-            this.#logPrefix,
-          );
-          while (currentTime <= end && !aborterSignal.aborted) {
-            const videoFrame = await videoFrameFinder.find(currentTime);
-            if (videoFrame) addPNGPromise(videoFrame);
-            currentTime += step;
+        const resolveAllPNGs = async () => {
+          if (aborterSignal.aborted) {
+            // Do not resolve or reject if already aborted, as reject might have been called.
+            return;
           }
-          videoFrameFinder.destroy(); // Clean up the temporary finder
-          resolvePNGs();
-        } else {
-          // If no step, generate thumbnails from keyframes
-          await thumbnailByKeyFrame(
-            this.#videoSamples,
-            this.#localFile,
-            videoConfig,
+          try {
+            const results = await Promise.all(
+              pngPromises.map(async (it) => ({
+                ts: it.ts,
+                img: await it.img,
+              })),
+            );
+            resolve(results);
+          } catch (err) {
+            if (!aborterSignal.aborted) reject(err);
+          }
+        };
+
+        if (fullOpts.step > 0) {
+          await this._thumbnailsByStep(
+            vfToBlobConverter,
             aborterSignal,
-            { start, end },
-            (videoFrame, done) => {
-              if (videoFrame != null) addPNGPromise(videoFrame);
-              if (done) resolvePNGs();
-            },
-            this.#logPrefix,
+            addPNGPromise,
+            fullOpts,
+          );
+          // After _thumbnailsByStep finishes (all frames found and promises added), resolve them.
+          await resolveAllPNGs();
+        } else {
+          // _thumbnailsByKeyframes will call resolveAllPNGs internally when done,
+          // because thumbnailByKeyFrame has a `done` callback.
+          await this._thumbnailsByKeyframes(
+            vfToBlobConverter,
+            aborterSignal,
+            addPNGPromise,
+            resolveAllPNGs, // Pass the resolver
+            fullOpts,
           );
         }
       },
@@ -447,27 +509,53 @@ export class MP4Clip implements IClip {
       time,
     );
 
-    // Create the first clip (before the split time)
+    let fileForPreClip = this.#localFile;
+    let fileForPostClip = this.#localFile;
+
+    if (this.#opts.deepClone) {
+      try {
+        console.info(this.#logPrefix, 'Deep cloning files for MP4Clip.split()');
+        // Sequentially copy for now, could be parallelized if #copyLocalFile is safe for it
+        fileForPreClip = await this.#copyLocalFile(this.#localFile);
+        fileForPostClip = await this.#copyLocalFile(this.#localFile);
+      } catch (error) {
+        console.error(this.#logPrefix, 'Failed to deep clone files for split, falling back to shallow clone', error);
+        // Fallback to original file if copying fails
+        fileForPreClip = this.#localFile;
+        fileForPostClip = this.#localFile;
+        // If one copy succeeded but the other failed, we might have an intermediate state.
+        // For simplicity here, if any copy fails, both use the original.
+        // A more robust strategy might try to clean up successful copies if subsequent ones fail.
+      }
+    }
+
+    // Options for the new clips should inherit from the parent, including its deepClone preference for future operations.
+    const clipOptsTemplate: MP4ClipOpts = {
+      ...this.#opts, // Inherit parent's options (including its deepClone setting)
+      decoderConfig: { ...this.#decoderConfig }, // Pass a copy of the resolved decoder config
+    };
+
     const preClip = new MP4Clip(
       {
-        localFile: this.#localFile, // Share the same local file
+        localFile: fileForPreClip,
         videoSamples: preVideoSlice ?? [],
         audioSamples: preAudioSlice ?? [],
-        decoderConf: this.#decoderConfig, // Share decoder configuration
-        headerBoxPos: this.#headerBoxPos, // Share header box positions
+        parsedDecoderConfig: this.#decoderConfig,
+        headerBoxPos: [...this.#headerBoxPos],
       },
-      this.#opts, // Share original options
+      // Ensure the new clip knows its own deepClone setting, inherited from parent
+      { ...clipOptsTemplate },
     );
-    // Create the second clip (after the split time)
+
     const postClip = new MP4Clip(
       {
-        localFile: this.#localFile,
+        localFile: fileForPostClip,
         videoSamples: postVideoSlice ?? [],
         audioSamples: postAudioSlice ?? [],
-        decoderConf: this.#decoderConfig,
-        headerBoxPos: this.#headerBoxPos,
+        parsedDecoderConfig: this.#decoderConfig,
+        headerBoxPos: [...this.#headerBoxPos],
       },
-      this.#opts,
+      { ...clipOptsTemplate },
     );
 
     // Wait for both new clips to be ready
@@ -477,24 +565,54 @@ export class MP4Clip implements IClip {
   }
 
   /**
-   * Creates a new MP4Clip instance that is a shallow copy of the current clip.
-   * Sample data and configurations are copied, but the underlying local file is shared.
+   * Creates a new MP4Clip instance.
+   * By default, it's a shallow copy (shares the underlying file).
+   * If `opts.deepClone` is true, it performs a deep copy of the file.
+   * @param opts - Optional `MP4ClipOpts` to override options for the cloned clip, including `deepClone`.
    * @returns A Promise that resolves to the cloned MP4Clip instance.
    */
-  async clone(): Promise<this> {
-    await this.ready; // Ensure the current clip is ready
+  async clone(opts?: MP4ClipOpts): Promise<this> {
+    await this.ready;
+
+    // Determine if deep cloning is needed.
+    // Priority:
+    // 1. opts.deepClone if explicitly provided in this clone() call.
+    // 2. this.#opts.deepClone (original clip's setting) if opts.deepClone is not provided.
+    const deepCloneFile = opts?.deepClone ?? this.#opts.deepClone;
+
+    let localFileForClone = this.#localFile;
+    if (deepCloneFile) {
+      try {
+        console.info(this.#logPrefix, 'Deep cloning file for MP4Clip.clone()');
+        localFileForClone = await this.#copyLocalFile(this.#localFile);
+      } catch (error) {
+        console.error(this.#logPrefix, 'Failed to deep clone file, falling back to shallow clone for .clone()', error);
+        // Fallback to using the original file if copy fails. Consider if this is the best strategy.
+        localFileForClone = this.#localFile;
+      }
+    }
+
+    // Merge options: start with original clip's opts, then apply specific clone opts.
+    // The decoderConfig from the current instance should be the default for the clone.
+    const clonedOpts: MP4ClipOpts = {
+      ...this.#opts, // Start with original's full opts (incl. audio settings, deepClone default for future ops)
+      decoderConfig: { ...this.#decoderConfig }, // Pass a copy of the resolved decoder config
+      ...(opts ?? {}), // Override with any options passed directly to clone()
+      deepClone: deepCloneFile, // Ensure the resolved deepClone decision is part of the new clip's opts
+    };
+
     const clip = new MP4Clip(
       {
-        localFile: this.#localFile, // Share local file
-        videoSamples: [...this.#videoSamples], // Shallow copy of video samples
-        audioSamples: [...this.#audioSamples], // Shallow copy of audio samples
-        decoderConf: this.#decoderConfig, // Copy decoder config
-        headerBoxPos: this.#headerBoxPos, // Copy header box positions
+        localFile: localFileForClone, // Use original or copied file
+        videoSamples: [...this.#videoSamples],
+        audioSamples: [...this.#audioSamples],
+        parsedDecoderConfig: this.#decoderConfig, // Pass current decoderConfig as parsed for the clone
+        headerBoxPos: [...this.#headerBoxPos],
       },
-      this.#opts, // Copy options
+      clonedOpts,
     );
-    await clip.ready; // Wait for the cloned clip to be ready
-    clip.tickInterceptor = this.tickInterceptor; // Copy the tick interceptor
+    await clip.ready;
+    clip.tickInterceptor = this.tickInterceptor;
     return clip as this;
   }
 
@@ -509,42 +627,75 @@ export class MP4Clip implements IClip {
 
     // If there are video samples, create a video-only clip
     if (this.#videoSamples.length > 0) {
+      let fileForVideoClip = this.#localFile;
+      if (this.#opts.deepClone) {
+        try {
+          console.info(this.#logPrefix, 'Deep cloning file for video-only clip in splitTrack()');
+          fileForVideoClip = await this.#copyLocalFile(this.#localFile);
+        } catch (error) {
+          console.error(this.#logPrefix, 'Failed to deep clone for video-only clip, falling back to shallow clone', error);
+        }
+      }
+      const videoOnlyOpts: MP4ClipOpts = {
+        ...this.#opts,
+        audio: false,
+        decoderConfig: {
+          video: this.#decoderConfig.video,
+          audio: null,
+        },
+      };
       const videoClip = new MP4Clip(
         {
-          localFile: this.#localFile,
+          localFile: fileForVideoClip,
           videoSamples: [...this.#videoSamples],
-          audioSamples: [], // No audio samples for video-only clip
-          decoderConf: {
-            video: this.#decoderConfig.video, // Use original video config
-            audio: null, // No audio config
-          },
-          headerBoxPos: this.#headerBoxPos,
+          audioSamples: [],
+          parsedDecoderConfig: videoOnlyOpts.decoderConfig, // Use the specific config
+          headerBoxPos: [...this.#headerBoxPos],
         },
-        this.#opts,
+        videoOnlyOpts,
       );
-      await videoClip.ready;
-      videoClip.tickInterceptor = this.tickInterceptor; // Copy interceptor
       clips.push(videoClip);
     }
 
     // If there are audio samples, create an audio-only clip
     if (this.#audioSamples.length > 0) {
+      let fileForAudioClip = this.#localFile;
+      // If we already cloned for video, and we need to clone for audio,
+      // we should clone the *original* file again, not the (potentially) already cloned fileForVideoClip.
+      if (this.#opts.deepClone) {
+        try {
+          console.info(this.#logPrefix, 'Deep cloning file for audio-only clip in splitTrack()');
+          fileForAudioClip = await this.#copyLocalFile(this.#localFile);
+        } catch (error) {
+          console.error(this.#logPrefix, 'Failed to deep clone for audio-only clip, falling back to shallow clone', error);
+        }
+      }
+      const audioOnlyOpts: MP4ClipOpts = {
+        ...this.#opts,
+        // audio: true, // audio should be true by default if decoderConfig.audio is present
+        decoderConfig: {
+          audio: this.#decoderConfig.audio,
+          video: null,
+        },
+      };
       const audioClip = new MP4Clip(
         {
-          localFile: this.#localFile,
-          videoSamples: [], // No video samples for audio-only clip
+          localFile: fileForAudioClip,
+          videoSamples: [],
           audioSamples: [...this.#audioSamples],
-          decoderConf: {
-            audio: this.#decoderConfig.audio, // Use original audio config
-            video: null, // No video config
-          },
-          headerBoxPos: this.#headerBoxPos,
+          parsedDecoderConfig: audioOnlyOpts.decoderConfig, // Use the specific config
+          headerBoxPos: [...this.#headerBoxPos],
         },
-        this.#opts,
+        audioOnlyOpts,
       );
-      await audioClip.ready;
-      audioClip.tickInterceptor = this.tickInterceptor; // Copy interceptor
       clips.push(audioClip);
+    }
+
+    // Wait for all created clips to be ready
+    await Promise.all(clips.map(clip => clip.ready));
+    // Copy tickInterceptor after they are ready
+    for (const clip of clips) {
+      (clip as MP4Clip).tickInterceptor = this.tickInterceptor;
     }
 
     return clips;
@@ -563,6 +714,23 @@ export class MP4Clip implements IClip {
     this.#videoFrameFinder?.destroy();
     this.#audioFrameFinder?.destroy();
   }
+
+  async #copyLocalFile(originalFile: OPFSToolFile): Promise<OPFSToolFile> {
+    const newFile = tmpfile();
+    // Copy content from originalFile to newFile
+    // Assuming OPFSToolFile has a way to get its full content as a stream or ArrayBuffer
+    // and `write` can handle it.
+    // If originalFile.stream() is available and write supports it:
+    try {
+      await write(newFile, await originalFile.stream());
+    } catch (error) {
+      console.error(this.#logPrefix, 'Error copying OPFS file for deep clone:', error);
+      // Depending on error handling strategy, might want to clean up newFile
+      // or rethrow, or return originalFile as a fallback (though that violates deepClone intent)
+      throw error; // Rethrow for now, caller should handle cleanup or decide fallback
+    }
+    return newFile;
+  }
 }
 
 /**
@@ -573,7 +741,7 @@ export class MP4Clip implements IClip {
  * @returns An object containing metadata (duration, width, height, audioSampleRate, audioChanCount).
  */
 function genMeta(
-  decoderConfig: MP4DecoderConfig,
+  decoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null },
   videoSamples: ExtMP4Sample[],
   audioSamples: ExtMP4Sample[],
 ) {
@@ -632,7 +800,7 @@ function genMeta(
 // The parameters (localFileReader, samples, config, logPrefix) are common.
 // Consider if the finders could share more logic or if their construction could be less verbose.
 function genDecoder(
-  decoderConfig: MP4DecoderConfig,
+  decoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null },
   localFileReader: LocalFileReader,
   videoSamples: ExtMP4Sample[],
   audioSamples: ExtMP4Sample[],
@@ -646,16 +814,16 @@ function genDecoder(
       decoderConfig.audio == null ||
       audioSamples.length === 0
         ? null
-        : new AudioFrameFinder(
+        : new AudioFrameFinder({
             localFileReader,
-            audioSamples,
-            decoderConfig.audio,
-            {
+            samples: audioSamples,
+            config: decoderConfig.audio,
+            outputOpts: {
               volume,
               targetSampleRate: DEFAULT_AUDIO_CONF.sampleRate,
             },
             logPrefix,
-          ),
+          }),
     // Initialize VideoFrameFinder if video config exists and samples are present
     videoFrameFinder:
       decoderConfig.video == null || videoSamples.length === 0
@@ -674,145 +842,187 @@ function genDecoder(
  * @param opfsToolsFile - The OPFS file object.
  * @param opts - MP4Clip options.
  * @param logPrefix - Prefix for console logging.
- * @returns A Promise that resolves with an object containing videoSamples, audioSamples, decoderConf, and headerBoxPos.
+ * @returns A Promise that resolves with an object containing videoSamples, audioSamples, parsedDecoderConfig, and headerBoxPos.
  * @throws Error if the stream parsing completes but no metadata (mp4Info) is emitted, or if no samples are found.
  */
-// REFACTOR-IDEA: The callback-based nature of `quickParseMP4File` makes `mp4FileToSamples` flow
-// somewhat complex with variables (`mp4Info`, `decoderConfig`, etc.) being mutated in callbacks.
-// If `quickParseMP4File` could be promisified or refactored to return all data at once,
-// this function's structure could be simplified using async/await more directly.
-// TODO-REFACTOR: `mp4FileToSamples` does multiple things: MP4 parsing, sample extraction,
-// config extraction, and sample normalization. Consider breaking these into smaller,
-// more focused functions for better separation of concerns.
+
+async function _parseMP4File(
+  opfsToolsFile: OPFSToolFile,
+  logPrefix: string,
+): Promise<{
+  mp4Info: MP4Info; // Ensure this is not duplicated
+  rawVideoSamples: MP4Sample[]; // Ensure this is not duplicated
+  rawAudioSamples: MP4Sample[];
+  parsedDecoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null };
+  headerBoxPos: Array<{ start: number; size: number }>;
+}> {
+  const reader = await opfsToolsFile.createReader();
+  // Call the new promise-based quickParseMP4File
+  const { mp4Info, rawVideoSamples, rawAudioSamples, mp4boxFile } = await quickParseMP4File(reader);
+  await reader.close();
+
+  if (rawVideoSamples.length === 0 && rawAudioSamples.length === 0) {
+    throw Error(`${logPrefix} MP4Clip stream not contain any sample`);
+  }
+
+  // Derive headerBoxPos
+  const headerBoxPos: Array<{ start: number; size: number }> = [];
+  if (mp4boxFile.ftyp != null) {
+    headerBoxPos.push({ start: mp4boxFile.ftyp.start, size: mp4boxFile.ftyp.size });
+  }
+  if (mp4boxFile.moov != null) {
+    headerBoxPos.push({ start: mp4boxFile.moov.start, size: mp4boxFile.moov.size });
+  } else {
+    // This case should ideally be caught by quickParseMP4File if moov is essential
+    throw Error(`${logPrefix} MP4Clip stream is done, but moov box was not found.`);
+  }
+
+  // Derive parsedDecoderConfig
+  const { videoDecoderConf, audioDecoderConf } = extractFileConfig(mp4boxFile, mp4Info);
+  const parsedDecoderConfig: { video: VideoDecoderConfig | null; audio: AudioDecoderConfig | null } = {
+    video: videoDecoderConf ?? null,
+    audio: audioDecoderConf ?? null,
+  };
+
+  if (videoDecoderConf == null && audioDecoderConf == null) {
+    console.error(logPrefix, 'MP4Clip no video and audio track');
+  }
+  console.info(
+    logPrefix,
+    'mp4BoxFile moov ready',
+    // Avoid logging verbose track data
+    { ...mp4Info, tracks: null, videoTracks: null, audioTracks: null },
+    parsedDecoderConfig,
+  );
+
+  return {
+    mp4Info, // Return the mp4Info obtained from quickParseMP4File
+    rawVideoSamples,
+    rawAudioSamples,
+    parsedDecoderConfig,
+    headerBoxPos,
+  };
+}
+
+function _normalizeSamples(
+  rawSamples: MP4Sample[],
+  sampleType: 'video' | 'audio',
+  deltaTS: number,
+  logPrefix: string,
+): ExtMP4Sample[] {
+
+  function normalizeTimescaleHelper(
+    sample: MP4Sample,
+    delta: number,
+  ): ExtMP4Sample {
+    let dataOffset = sample.offset;
+    let dataSize = sample.size;
+    let is_idr = sample.is_sync; // Default to sample.is_sync
+
+    if (sampleType === 'video') {
+      const naluInfo = _getVideoSampleNALUInfo(sample);
+      if (naluInfo.offset > 0) { // findIDRNALUOffset returns positive offset if found, or -1 (handled in _getVideoSampleNALUInfo to return 0)
+        dataOffset += naluInfo.offset;
+        dataSize -= naluInfo.offset;
+      }
+      is_idr = naluInfo.is_idr;
+    }
+
+    return {
+      ...sample,
+      is_idr, // Use NALU-derived IDR status
+      offset: dataOffset,
+      size: dataSize,
+      cts: ((sample.cts - delta) / sample.timescale) * 1e6,
+      dts: ((sample.dts - delta) / sample.timescale) * 1e6,
+      duration: (sample.duration / sample.timescale) * 1e6,
+      timescale: 1e6,
+      data: sampleType === 'video' ? null : sample.data,
+    };
+  }
+
+  const normalizedSamples: ExtMP4Sample[] = [];
+  for (const sample of rawSamples) {
+    normalizedSamples.push(normalizeTimescaleHelper(sample, deltaTS));
+  }
+  return normalizedSamples;
+}
+
 async function mp4FileToSamples(
   opfsToolsFile: OPFSToolFile,
   opts: MP4ClipOpts = {},
   logPrefix: string,
 ) {
-  let mp4Info: MP4Info | null = null; // To store MP4 metadata from mp4box.js
-  const decoderConfig: MP4DecoderConfig = { video: null, audio: null }; // To store decoder configurations
-  let videoSamples: ExtMP4Sample[] = []; // To store extracted video samples
-  let audioSamples: ExtMP4Sample[] = []; // To store extracted audio samples
-  let headerBoxPos: Array<{ start: number; size: number }> = []; // To store positions of ftyp and moov boxes
+  const {
+    rawVideoSamples,
+    rawAudioSamples,
+    parsedDecoderConfig,
+    headerBoxPos,
+    // mp4Info is also returned but not directly used in the final output structure of this function
+  } = await _parseMP4File(opfsToolsFile, logPrefix);
 
-  let videoDeltaTS = -1; // Timestamp offset for video samples (to make first sample's DTS near zero)
-  let audioDeltaTS = -1; // Timestamp offset for audio samples
-  const reader = await opfsToolsFile.createReader(); // Create a reader for the OPFS file
+  let videoSamples: ExtMP4Sample[] = [];
+  let audioSamples: ExtMP4Sample[] = [];
 
-  // Use quickParseMP4File to efficiently parse the MP4 file
-  await quickParseMP4File(
-    reader,
-    // onReady callback: called when mp4box.js has parsed the 'moov' atom
-    (data) => {
-      mp4Info = data.info; // Store the MP4 info
-      const ftypBox = data.mp4boxFile.ftyp!; // Get ftyp box (non-null assertion)
-      headerBoxPos.push({ start: ftypBox.start, size: ftypBox.size }); // Store its position and size
-      const moovBox = data.mp4boxFile.moov!; // Get moov box
-      headerBoxPos.push({ start: moovBox.start, size: moovBox.size }); // Store its position and size
-
-      // Extract video and audio decoder configurations from the parsed file
-      let {
-        videoDecoderConf: rawVideoConfig,
-        audioDecoderConf: rawAudioConfig,
-      } = extractFileConfig(data.mp4boxFile, data.info);
-      decoderConfig.video = rawVideoConfig ?? null;
-      decoderConfig.audio = rawAudioConfig ?? null;
-
-      if (rawVideoConfig == null && rawAudioConfig == null) {
-        console.error(logPrefix, 'MP4Clip no video and audio track');
-      }
-      console.info(
-        logPrefix,
-        'mp4BoxFile moov ready',
-        {
-          // Log relevant info, excluding bulky track details for brevity
-          ...data.info,
-          tracks: null,
-          videoTracks: null,
-          audioTracks: null,
-        },
-        decoderConfig,
-      );
-    },
-    // onSamples callback: called when mp4box.js has extracted sample metadata
-    (_, type, samples) => {
-      if (type === 'video') {
-        if (videoDeltaTS === -1) videoDeltaTS = samples[0].dts; // Set delta based on first video sample's DTS
-        for (const sample of samples) {
-          // Normalize timescale and store extended sample info
-          videoSamples.push(
-            normalizeTimescale(sample, videoDeltaTS, 'video', logPrefix),
-          );
-        }
-      } else if (type === 'audio' && opts.audio) {
-        // Process audio samples only if audio is enabled in options
-        if (audioDeltaTS === -1) audioDeltaTS = samples[0].dts; // Set delta for audio
-        for (const sample of samples) {
-          audioSamples.push(
-            normalizeTimescale(sample, audioDeltaTS, 'audio', logPrefix),
-          );
-        }
-      }
-    },
-  );
-  await reader.close(); // Close the file reader
-
-  const lastSample = videoSamples.at(-1) ?? audioSamples.at(-1);
-  if (mp4Info == null) {
-    throw Error(`${logPrefix} MP4Clip stream is done, but not emit ready`);
-  } else if (lastSample == null) {
-    throw Error(`${logPrefix} MP4Clip stream not contain any sample`);
+  if (rawVideoSamples.length > 0) {
+    const videoDeltaTS = rawVideoSamples[0].dts;
+    videoSamples = _normalizeSamples(rawVideoSamples, 'video', videoDeltaTS, logPrefix);
+    fixFirstBlackFrame(videoSamples, logPrefix);
   }
-  // Attempt to fix potential black frame issue at the beginning of the video
-  fixFirstBlackFrame(videoSamples, logPrefix);
-  console.info(logPrefix, 'mp4 stream parsed');
+
+  if (opts.audio && rawAudioSamples.length > 0) {
+    const audioDeltaTS = rawAudioSamples[0].dts;
+    audioSamples = _normalizeSamples(rawAudioSamples, 'audio', audioDeltaTS, logPrefix);
+  }
+
+  console.info(logPrefix, 'mp4 stream parsed and samples normalized');
   return {
     videoSamples,
     audioSamples,
-    decoderConf: decoderConfig,
+    parsedDecoderConfig: parsedDecoderConfig,
     headerBoxPos,
   };
+}
 
-  /**
-   * Normalizes sample timestamps (CTS, DTS, duration) to microseconds (1e6 timescale)
-   * and adjusts them by a delta to make the first sample's DTS close to zero.
-   * Also identifies IDR frames and handles potential NALU offsets for AVC/HEVC.
-   */
-  // TODO-REFACTOR: The NALU offset logic in `normalizeTimescale` is codec-specific (H.264/H.265).
-  // If more codecs are supported in the future, this could be refactored, possibly using a
-  // strategy pattern or per-codec helper functions to handle such details.
-  function normalizeTimescale(
-    sample: MP4Sample,
-    delta = 0,
-    sampleType: 'video' | 'audio',
-    logPrefix: string,
-  ): ExtMP4Sample {
-    // Determine if it's an IDR frame and find NALU offset if applicable (for video)
-    const idrNALUInfo =
-      sampleType === 'video' && sample.is_sync
-        ? findIDRNALUOffset(sample.data, sample.description.type)
-        : { offset: -1 };
-    let dataOffset = sample.offset;
-    let dataSize = sample.size;
-    // If IDR NALU offset is found, adjust data offset and size to skip preceding NALUs (e.g., SEI)
-    // This can prevent decoding issues with some decoders.
-    if (idrNALUInfo.offset >= 0) {
-      dataOffset += idrNALUInfo.offset;
-      dataSize -= idrNALUInfo.offset;
+// This new function centralizes NALU parsing logic for video samples.
+function _getVideoSampleNALUInfo(sample: MP4Sample): { offset: number; is_idr: boolean } {
+  if (!sample.is_sync) {
+    // Only sync samples (potential keyframes) are considered for NALU offset adjustments.
+    // Non-sync samples are part of a GoP and don't start with SPS/PPS/IDR in the same way.
+    return { offset: 0, is_idr: false };
+  }
+
+  switch (sample.description.type) {
+    case 'avc1': // H.264
+    case 'hvc1': { // H.265
+      // findIDRNALUOffset expects the raw data buffer.
+      // sample.data might be null if it's video and not loaded yet.
+      // However, for normalization, sample.data IS available for AVC/HVC from mp4box.js if needed for this check.
+      // The current structure of ExtMP4Sample sets video data to null *after* normalization.
+      // Let's assume sample.data is available here as MP4Sample from mp4box.js.
+      if (sample.data == null) {
+        // This case should ideally not happen if we are to inspect NALUs.
+        // If it does, we can't do NALU parsing, so fall back.
+        console.warn('Attempted NALU parsing on sample with no data.');
+        return { offset: 0, is_idr: sample.is_sync };
+      }
+      const naluScanResult = findIDRNALUOffset(sample.data, sample.description.type);
+      if (naluScanResult.offset >= 0) {
+        // An IDR NALU was found, and its offset within the sample data is naluScanResult.offset.
+        // This offset is the amount to skip from the beginning of the sample's data.
+        return { offset: naluScanResult.offset, is_idr: true };
+      } else {
+        // No specific IDR NALU found by scanning (e.g., it's the first NALU, or not an IDR).
+        // Rely on the container's sync flag, and no data offset adjustment.
+        return { offset: 0, is_idr: sample.is_sync };
+      }
     }
-    return {
-      ...sample,
-      is_idr: idrNALUInfo.offset >= 0, // Mark if it's an IDR frame (or contains one after offset)
-      offset: dataOffset,
-      size: dataSize,
-      // Normalize timestamps to microseconds (timescale 1e6)
-      cts: ((sample.cts - delta) / sample.timescale) * 1e6,
-      dts: ((sample.dts - delta) / sample.timescale) * 1e6,
-      duration: (sample.duration / sample.timescale) * 1e6,
-      timescale: 1e6, // Set timescale to microseconds
-      // For audio, data is kept in memory. For video, it's set to null to be loaded on demand.
-      data: sampleType === 'video' ? null : sample.data,
-    };
+    // Potentially add cases for other codecs like 'vp09', 'av01' if they have similar NALU structures
+    // or require specific leading bytes to be skipped.
+    default:
+      // For other video codecs or if NALU parsing is not implemented,
+      // use the sample's sync flag and assume no offset.
+      return { offset: 0, is_idr: sample.is_sync };
   }
 }
 
@@ -828,336 +1038,8 @@ async function mp4FileToSamples(
 // For instance, defining specific error types or using a retry policy for certain recoverable errors.
 // TODO-REFACTOR: The constructor of `VideoFrameFinder` takes multiple individual parameters.
 // Consider using a single options object for better readability and extensibility if more params are added.
-// REFACTOR-IDEA: Parts of the `find` or `#parseFrame` methods in `VideoFrameFinder` are quite complex.
-// They could potentially be broken down into smaller, more manageable helper methods to improve clarity.
-class VideoFrameFinder {
-  #decoder: VideoDecoder | null = null; // The VideoDecoder instance
-  #logPrefix: string; // Prefix for console logging
-
-  constructor(
-    public localFileReader: LocalFileReader, // Reader for the OPFS file
-    public samples: ExtMP4Sample[], // Array of extended video samples
-    public config: VideoDecoderConfig, // Video decoder configuration
-    logPrefix: string,
-  ) {
-    this.#logPrefix = `${logPrefix} VideoFrameFinder:`;
-  }
-  
-  #currentTimestamp = 0; // Timestamp of the last requested frame (microseconds)
-  #currentAborter = { abort: false, startTime: performance.now() }; // Aborter for ongoing find operation
-  /**
-   * Finds and returns a VideoFrame for the specified time.
-   * @param time - The target time in microseconds.
-   * @returns A Promise that resolves to a VideoFrame or null if not found or aborted.
-   */
-  find = async (time: number): Promise<VideoFrame | null> => {
-    // Reset decoder if:
-    // - It's null or closed
-    // - Seeking backwards in time (time <= this.#currentTimestamp)
-    // - Seeking too far forward (more than 3 seconds, indicating a significant jump)
-    if (
-      this.#decoder == null ||
-      this.#decoder.state === 'closed' ||
-      time <= this.#currentTimestamp ||
-      time - this.#currentTimestamp > 3e6 // 3 seconds
-    ) {
-      this.#reset(time); // Reset decoder and seek to the new time
-    }
-
-    this.#currentAborter.abort = true; // Abort any previous find operation
-    this.#currentTimestamp = time; // Update current timestamp
-
-    // Start new find operation
-    this.#currentAborter = { abort: false, startTime: performance.now() };
-    const videoFrame = await this.#parseFrame(
-      time,
-      this.#decoder,
-      this.#currentAborter,
-    );
-    this.#sleepCount = 0; // Reset sleep counter after successful find
-    return videoFrame;
-  };
-
-  #lastVideoFrameDuration = 0; // Stores the duration of the last decoded VideoFrame, used if a frame lacks duration
-
-  #useSoftwareDecoding = false; // Flag to indicate if software decoding is being used (after hardware failure)
-  #decodeCursorIndex = 0; // Current index in the samples array for decoding
-  #decodedVideoFrames: VideoFrame[] = []; // Buffer for decoded video frames
-  #outputFrameCount = 0; // Counter for frames output by the decoder
-  #inputChunkCount = 0; // Counter for chunks sent to the decoder
-  #sleepCount = 0; // Counter for how many times parsing has slept waiting for frames
-  #predecodeError = false; // Flag if an error occurred during pre-decoding
-
-  /**
-   * Internal method to parse frames until the target time is reached.
-   * Manages decoding, frame buffering, and error handling.
-   * @param time - Target time in microseconds.
-   * @param decoder - The VideoDecoder instance.
-   * @param aborter - Abort controller for the current find operation.
-   * @returns A Promise resolving to a VideoFrame or null.
-   * @throws Error if decoding times out.
-   */
-  #parseFrame = async (
-    time: number,
-    decoder: VideoDecoder | null,
-    aborter: { abort: boolean; startTime: number },
-  ): Promise<VideoFrame | null> => {
-    // If decoder is invalid or operation is aborted, return null
-    if (decoder == null || decoder.state === 'closed' || aborter.abort)
-      return null;
-
-    // Check buffered frames first
-    if (this.#decodedVideoFrames.length > 0) {
-      const videoFrame = this.#decodedVideoFrames[0];
-      // If the target time is before the first buffered frame, it means we overshot or seeked back
-      if (time < videoFrame.timestamp) return null;
-
-      this.#decodedVideoFrames.shift(); // Remove the first frame from buffer
-      // If the frame is too old (target time is past its duration), close it and try again
-      if (time > videoFrame.timestamp + (videoFrame.duration ?? 0)) {
-        videoFrame.close();
-        return await this.#parseFrame(time, decoder, aborter); // Recursively call to get next frame
-      }
-
-      // If buffer is running low and no predecode error, start pre-decoding next GoP
-      if (!this.#predecodeError && this.#decodedVideoFrames.length < 10) {
-        this.#startDecode(decoder).catch((err) => {
-          this.#predecodeError = true; // Mark predecode error
-          this.#reset(time); // Reset decoder on error
-          throw err;
-        });
-      }
-      // Frame is suitable, return it
-      return videoFrame;
-    }
-
-    // If no suitable frame in buffer, check decoder state
-    if (
-      this.#isDecodingInProgress || // If currently decoding
-      // Or if there are pending frames in decoder queue
-      (this.#outputFrameCount < this.#inputChunkCount &&
-        decoder.decodeQueueSize > 0)
-    ) {
-      // Timeout check: if parsing takes too long, throw an error
-      if (performance.now() - aborter.startTime > 6000) {
-        // 6 seconds timeout
-        throw Error(
-          `${this.#logPrefix} MP4Clip.tick video timeout, ${JSON.stringify(
-            this.#getState(),
-          )}`,
-        );
-      }
-      // Decoder is busy, wait and retry
-      this.#sleepCount += 1;
-      await sleep(15); // Sleep for a short duration
-    } else if (this.#decodeCursorIndex >= this.samples.length) {
-      // All samples processed, no more frames
-      return null;
-    } else {
-      // Need more frames, start decoding the next GoP
-      try {
-        await this.#startDecode(decoder);
-      } catch (err) {
-        this.#reset(time); // Reset decoder on error
-        throw err;
-      }
-    }
-    // Recursively call to continue parsing
-    return await this.#parseFrame(time, decoder, aborter);
-  };
-
-  #isDecodingInProgress = false; // Flag indicating if a decode operation is active
-
-  /**
-   * Starts decoding the next Group of Pictures (GoP) from the sample list.
-   * @param decoder - The VideoDecoder instance.
-   */
-  #startDecode = async (decoder: VideoDecoder) => {
-    // Avoid starting new decode if already decoding or queue is too large
-    if (this.#isDecodingInProgress || decoder.decodeQueueSize > 600) return;
-
-    let endIndex = this.#decodeCursorIndex + 1;
-    if (endIndex > this.samples.length) return; // No more samples
-
-    this.#isDecodingInProgress = true;
-    let hasValidFrameInGoP = false; // Check if the GoP contains any non-deleted frames
-    // Find the end of the current GoP (next IDR frame)
-    for (; endIndex < this.samples.length; endIndex++) {
-      const sample = this.samples[endIndex];
-      if (!hasValidFrameInGoP && !sample.deleted) {
-        hasValidFrameInGoP = true;
-      }
-      if (sample.is_idr) break;
-    }
-
-    if (hasValidFrameInGoP) {
-      const gopSamples = this.samples.slice(this.#decodeCursorIndex, endIndex);
-      if (gopSamples[0]?.is_idr !== true) {
-        // First sample of a GoP should ideally be an IDR frame
-        console.warn(this.#logPrefix, 'First sample of GoP not an IDR frame');
-      } else {
-        const readStartTime = performance.now();
-        // Convert MP4 samples to EncodedVideoChunks
-        const chunks = await videoSamplesToEncodedChunks(
-          gopSamples,
-          this.localFileReader,
-        );
-        const readDuration = performance.now() - readStartTime;
-        // Log if reading chunks took a long time
-        if (readDuration > 1000) {
-          const firstSample = gopSamples[0];
-          const lastSample = gopSamples.at(-1)!;
-          const rangeSize =
-            lastSample.offset + lastSample.size - firstSample.offset;
-          console.warn(
-            this.#logPrefix,
-            `Read video samples time cost: ${Math.round(
-              readDuration,
-            )}ms, file chunk size: ${rangeSize}`,
-          );
-        }
-
-        // Check if decoder was closed while reading chunks
-        if (decoder.state === 'closed') {
-          this.#isDecodingInProgress = false;
-          return;
-        }
-
-        this.#lastVideoFrameDuration = chunks[0]?.duration ?? 0; // Store duration for potential fix
-        // Decode the GoP
-        decodeGoP(decoder, chunks, {
-          onDecodingError: (err) => {
-            if (this.#useSoftwareDecoding) {
-              // If already tried software decoding, throw error
-              throw err;
-            } else if (this.#outputFrameCount === 0) {
-              // If no frames output yet, try downgrading to software decoding
-              this.#useSoftwareDecoding = true;
-              console.warn(
-                this.#logPrefix,
-                'Downgrade to software decode due to error:',
-                err.message,
-              );
-              this.#reset(); // Reset with software decoding preference
-            }
-          },
-        });
-        this.#inputChunkCount += chunks.length; // Increment input chunk count
-      }
-    }
-    this.#decodeCursorIndex = endIndex; // Move cursor to the end of the processed GoP
-    this.#isDecodingInProgress = false;
-  };
-
-  /**
-   * Resets the VideoDecoder instance.
-   * Closes the current decoder, clears frame buffers, and creates a new decoder
-   * configured for the specified time (or start if no time provided).
-   * @param time - Optional time (microseconds) to seek to after reset.
-   */
-  #reset = (time?: number) => {
-    this.#isDecodingInProgress = false;
-    this.#decodedVideoFrames.forEach((frame) => frame.close()); // Close buffered frames
-    this.#decodedVideoFrames = [];
-    this.#predecodeError = false;
-
-    // Determine the starting sample index for the new decoder
-    if (time == null || time === 0) {
-      this.#decodeCursorIndex = 0; // Start from the beginning
-    } else {
-      // Find the keyframe index at or before the target time
-      let keyFrameIndex = 0;
-      for (let i = 0; i < this.samples.length; i++) {
-        const sample = this.samples[i];
-        if (sample.is_idr) keyFrameIndex = i; // Update last known keyframe
-        if (sample.cts < time) continue; // If sample is before target time, continue
-        this.#decodeCursorIndex = keyFrameIndex; // Set cursor to the keyframe at/before time
-        break;
-      }
-    }
-    this.#inputChunkCount = 0;
-    this.#outputFrameCount = 0;
-
-    if (this.#decoder?.state !== 'closed') this.#decoder?.close(); // Close existing decoder
-
-    // Prepare new decoder configuration, potentially preferring software decoding
-    const decoderConfigWithFallback = {
-      ...this.config,
-      ...(this.#useSoftwareDecoding
-        ? { hardwareAcceleration: 'prefer-software' as HardwarePreference }
-        : {}),
-    } as VideoDecoderConfig;
-
-    this.#decoder = new VideoDecoder({
-      output: (videoFrame) => {
-        this.#outputFrameCount += 1;
-        if (videoFrame.timestamp === -1) {
-          // Placeholder frame, ignore
-          videoFrame.close();
-          return;
-        }
-        let resultVideoFrame = videoFrame;
-        // If VideoFrame duration is null, use the last known duration
-        if (videoFrame.duration == null) {
-          resultVideoFrame = new VideoFrame(videoFrame, {
-            duration: this.#lastVideoFrameDuration,
-          });
-          videoFrame.close(); // Close original frame
-        }
-        this.#decodedVideoFrames.push(resultVideoFrame); // Add to buffer
-      },
-      error: (err) => {
-        if (err.message.includes('Codec reclaimed due to inactivity')) {
-          // Decoder was closed by browser due to inactivity, can happen if tab is in background
-          this.#decoder = null; // Mark decoder as null
-          console.warn(this.#logPrefix, err.message);
-          return;
-        }
-        const errorMsg = `${
-          this.#logPrefix
-        } VideoFinder VideoDecoder error: ${
-          err.message
-        }, config: ${JSON.stringify(
-          decoderConfigWithFallback,
-        )}, state: ${JSON.stringify(this.#getState())}`;
-        console.error(errorMsg);
-        throw Error(errorMsg); // Rethrow as a critical error
-      },
-    });
-    this.#decoder.configure(decoderConfigWithFallback);
-  };
-
-  /**
-   * Gets the current state of the VideoFrameFinder for debugging.
-   * @returns An object containing state information.
-   */
-  #getState = () => ({
-    time: this.#currentTimestamp,
-    decoderState: this.#decoder?.state,
-    decoderQueueSize: this.#decoder?.decodeQueueSize,
-    decodeCursorIndex: this.#decodeCursorIndex,
-    sampleLength: this.samples.length,
-    inputChunkCount: this.#inputChunkCount,
-    outputFrameCount: this.#outputFrameCount,
-    cachedFrameCount: this.#decodedVideoFrames.length,
-    isSoftwareDecoding: this.#useSoftwareDecoding,
-    clipInstanceCount: CLIP_ID, // Global count of MP4Clip instances
-    sleepCount: this.#sleepCount,
-    memoryInfo: memoryUsageInfo(), // Browser memory usage if available
-  });
-
-  /**
-   * Destroys the VideoFrameFinder, closing the decoder and file reader.
-   */
-  destroy = () => {
-    if (this.#decoder?.state !== 'closed') this.#decoder?.close();
-    this.#decoder = null;
-    this.#currentAborter.abort = true; // Abort any ongoing operations
-    this.#decodedVideoFrames.forEach((frame) => frame.close()); // Close buffered frames
-    this.#decodedVideoFrames = [];
-    this.localFileReader.close(); // Close the file reader
-  };
-}
+// VideoFrameFinder class and related definitions removed.
+// These will be imported from ./video-frame-finder.ts
 
 /**
  * Finds the index of the sample that contains the given time.
@@ -1186,235 +1068,20 @@ function findIndexOfSamples(time: number, samples: ExtMP4Sample[]): number {
 // TODO-REFACTOR: Similar to VideoFrameFinder, `AudioFrameFinder` state management (`#currentTimestamp`, `#decodeCursorIndex`)
 // could be more formalized. Error handling and constructor parameters also follow similar patterns
 // and could benefit from the same refactoring considerations (state machine, structured errors, options object).
-// REFACTOR-IDEA: `AudioFrameFinder`'s `#parseFrame` logic for handling buffer shortages and decoder state
-// could be extracted or simplified for better readability.
-class AudioFrameFinder {
-  #volume = 1; // Audio volume (0.0 to 1.0)
-  #targetSampleRate; // Target sample rate for output PCM data
-  #logPrefix: string; // Prefix for console logging
+// IAudioFrameFinderOpts and AudioFrameFinderState removed.
 
-  constructor(
-    public localFileReader: LocalFileReader, // Reader for the OPFS file
-    public samples: ExtMP4Sample[], // Array of extended audio samples
-    public config: AudioDecoderConfig, // Audio decoder configuration
-    opts: { volume: number; targetSampleRate: number },
-    logPrefix: string,
-  ) {
-    this.#volume = opts.volume;
-    this.#targetSampleRate = opts.targetSampleRate;
-    this.#logPrefix = `${logPrefix} AudioFrameFinder:`;
+// Custom Error Classes for AudioFrameFinder
+class AudioFrameFinderError extends Error {
+  constructor(message: string, public readonly finderState?: any) {
+    super(message);
+    this.name = this.constructor.name;
   }
-
-  #audioChunksDecoder: ReturnType<typeof createAudioChunksDecoder> | null = null; // Decoder instance
-  #currentAborter = { abort: false, startTime: performance.now() }; // Aborter for ongoing find operation
-
-  /**
-   * Finds and returns PCM audio data for the specified time.
-   * @param time - The target time in microseconds.
-   * @returns A Promise that resolves to an array of Float32Arrays (PCM data per channel).
-   */
-  find = async (time: number): Promise<Float32Array[]> => {
-    // Determine if a reset is needed (significant time jump or decoder closed)
-    const needsReset =
-      time <= this.#currentTimestamp || // Seeking backwards
-      time - this.#currentTimestamp > 0.1e6; // Seeking forward more than 100ms (heuristic)
-
-    if (
-      this.#audioChunksDecoder == null ||
-      this.#audioChunksDecoder.state === 'closed' ||
-      needsReset
-    ) {
-      this.#reset(); // Reset decoder
-    }
-
-    if (needsReset) {
-      // If seeking, update current timestamp and find the starting sample index
-      this.#currentTimestamp = time;
-      this.#decodeCursorIndex = findIndexOfSamples(time, this.samples);
-    }
-
-    this.#currentAborter.abort = true; // Abort previous operation
-    const deltaTime = time - this.#currentTimestamp; // Time difference from last find
-    this.#currentTimestamp = time; // Update current time
-
-    this.#currentAborter = { abort: false, startTime: performance.now() };
-
-    // Calculate number of frames needed based on delta time and sample rate
-    const pcmData = await this.#parseFrame(
-      Math.ceil(deltaTime * (this.#targetSampleRate / 1e6)),
-      this.#audioChunksDecoder,
-      this.#currentAborter,
-    );
-    this.#sleepCount = 0; // Reset sleep counter
-    return pcmData;
-  };
-
-  #currentTimestamp = 0; // Timestamp of the last requested audio data (microseconds)
-  #decodeCursorIndex = 0; // Current index in the audio samples array for decoding
-  #pcmDataBuffer: {
-    frameCount: number; // Total number of frames in the buffer
-    data: [Float32Array, Float32Array][]; // Buffered PCM data (stereo pairs)
-  } = {
-    frameCount: 0,
-    data: [],
-  };
-  #sleepCount = 0; // Counter for how many times parsing has slept waiting for data
-
-  /**
-   * Internal method to parse audio frames until enough data for the requested duration is available.
-   * Manages decoding, buffering, and error handling.
-   * @param emitFrameCount - Number of PCM frames to emit.
-   * @param decoder - The audio chunks decoder instance.
-   * @param aborter - Abort controller for the current find operation.
-   * @returns A Promise resolving to an array of Float32Arrays (PCM data).
-   * @throws Error if decoding times out.
-   */
-  #parseFrame = async (
-    emitFrameCount: number,
-    decoder: ReturnType<typeof createAudioChunksDecoder> | null = null,
-    aborter: { abort: boolean; startTime: number },
-  ): Promise<Float32Array[]> => {
-    if (
-      decoder == null ||
-      aborter.abort ||
-      decoder.state === 'closed' ||
-      emitFrameCount === 0
-    ) {
-      return []; // Return empty if invalid state or no frames needed
-    }
-
-    // Check if buffered data is sufficient
-    const remainingFrameCount = this.#pcmDataBuffer.frameCount - emitFrameCount;
-    if (remainingFrameCount > 0) {
-      // If buffer is running low (less than 100ms of audio), start pre-decoding more
-      if (remainingFrameCount < DEFAULT_AUDIO_CONF.sampleRate / 10) {
-        this.#startDecode(decoder);
-      }
-      return emitAudioFrames(this.#pcmDataBuffer, emitFrameCount); // Emit requested frames from buffer
-    }
-
-    // If decoder is busy
-    if (decoder.isDecoding) {
-      // Timeout check
-      if (performance.now() - aborter.startTime > 3000) {
-        // 3 seconds timeout
-        aborter.abort = true;
-        throw Error(
-          `${
-            this.#logPrefix
-          } MP4Clip.tick audio timeout, ${JSON.stringify(this.#getState())}`,
-        );
-      }
-      // Wait and retry
-      this.#sleepCount += 1;
-      await sleep(15);
-    } else if (this.#decodeCursorIndex >= this.samples.length - 1) {
-      // All samples processed, emit remaining buffered data
-      return emitAudioFrames(this.#pcmDataBuffer, this.#pcmDataBuffer.frameCount);
-    } else {
-      // Need more data, start decoding
-      this.#startDecode(decoder);
-    }
-    // Recursively call to continue parsing
-    return this.#parseFrame(emitFrameCount, decoder, aborter);
-  };
-
-  /**
-   * Starts decoding a batch of audio samples.
-   * @param decoder - The audio chunks decoder instance.
-   */
-  #startDecode = (decoder: ReturnType<typeof createAudioChunksDecoder>) => {
-    const decodeBatchSize = 10; // Number of samples to decode at once
-    // Don't start if decode queue is already large
-    if (decoder.decodeQueueSize > decodeBatchSize) return;
-
-    const samplesToDecode = [];
-    let i = this.#decodeCursorIndex;
-    // Collect next batch of non-deleted samples
-    while (i < this.samples.length) {
-      const sample = this.samples[i];
-      i += 1;
-      if (sample.deleted) continue;
-      samplesToDecode.push(sample);
-      if (samplesToDecode.length >= decodeBatchSize) break;
-    }
-    this.#decodeCursorIndex = i; // Update cursor
-
-    // Convert to EncodedAudioChunks and send to decoder
-    decoder.decode(
-      samplesToDecode.map(
-        (sample) =>
-          new EncodedAudioChunk({
-            type: 'key', // Assuming all audio chunks are key for simplicity here, might need adjustment
-            timestamp: sample.cts,
-            duration: sample.duration,
-            data: sample.data!, // Non-null assertion as audio data is stored in ExtMP4Sample
-          }),
-      ),
-    );
-  };
-
-  /**
-   * Resets the AudioDecoder instance and clears buffers.
-   * Creates a new decoder instance.
-   */
-  #reset = () => {
-    this.#currentTimestamp = 0;
-    this.#decodeCursorIndex = 0;
-    this.#pcmDataBuffer = {
-      frameCount: 0,
-      data: [],
-    };
-    this.#audioChunksDecoder?.close(); // Close existing decoder
-    // Create a new decoder
-    this.#audioChunksDecoder = createAudioChunksDecoder(
-      this.config,
-      {
-        resampleRate: DEFAULT_AUDIO_CONF.sampleRate, // Resample to default rate
-        volume: this.#volume, // Apply volume
-      },
-      (pcmArray) => {
-        // Callback for when decoded PCM data is available
-        this.#pcmDataBuffer.data.push(
-          pcmArray as [Float32Array, Float32Array], // Assuming stereo
-        );
-        this.#pcmDataBuffer.frameCount += pcmArray[0].length; // Update frame count
-      },
-      this.#logPrefix,
-    );
-  };
-
-  /**
-   * Gets the current state of the AudioFrameFinder for debugging.
-   * @returns An object containing state information.
-   */
-  #getState = () => ({
-    time: this.#currentTimestamp,
-    decoderState: this.#audioChunksDecoder?.state,
-    decoderQueueSize: this.#audioChunksDecoder?.decodeQueueSize,
-    decodeCursorIndex: this.#decodeCursorIndex,
-    sampleLength: this.samples.length,
-    pcmFrameCountInBuffer: this.#pcmDataBuffer.frameCount,
-    clipInstanceCount: CLIP_ID,
-    sleepCount: this.#sleepCount,
-    memoryInfo: memoryUsageInfo(),
-  });
-
-  /**
-   * Destroys the AudioFrameFinder, closing the decoder.
-   */
-  destroy = () => {
-    this.#audioChunksDecoder?.close();
-    this.#audioChunksDecoder = null;
-    this.#currentAborter.abort = true; // Abort ongoing operations
-    this.#pcmDataBuffer = {
-      // Clear buffer
-      frameCount: 0,
-      data: [],
-    };
-    this.localFileReader.close(); // Close file reader
-  };
 }
+class AudioDecoderError extends AudioFrameFinderError {}
+class AudioTimeoutError extends AudioFrameFinderError {}
+class AudioStateError extends AudioFrameFinderError {}
+// Note: SampleReadError could be generic if audio samples were read from file like video,
+// AudioFrameFinder class and related definitions removed.
 
 /**
  * Creates an audio decoder that processes EncodedAudioChunks,

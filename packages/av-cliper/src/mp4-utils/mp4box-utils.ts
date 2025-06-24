@@ -217,72 +217,94 @@ function parseAudioInfo4ESDSBox(esds: ESDSBoxParser) {
 // very high sample rates). Consider making this configurable or dynamically adjusting it.
 export async function quickParseMP4File(
   reader: Awaited<ReturnType<ReturnType<typeof file>['createReader']>>,
-  onReady: (data: { mp4boxFile: MP4File; info: MP4Info }) => void,
-  onSamples: (
-    id: number,
-    sampleType: 'video' | 'audio',
-    samples: MP4Sample[],
-  ) => void,
-) {
-  // Create a new mp4box file parser instance.
-  const mp4boxFile = mp4box.createFile(false);
+): Promise<ParsedMP4Data> {
+  return new Promise<ParsedMP4Data>((resolve, reject) => {
+    const mp4boxFile = mp4box.createFile(false);
+    let mp4Info: MP4Info | null = null;
+    const rawVideoSamples: MP4Sample[] = [];
+    const rawAudioSamples: MP4Sample[] = [];
 
-  // Set up the callback for when the file's metadata ('moov' box) is ready.
-  mp4boxFile.onReady = (info) => {
-    // Fire the user-provided onReady callback with the file info.
-    onReady({ mp4boxFile, info });
+    mp4boxFile.onReady = (info) => {
+      mp4Info = info;
 
-    // After metadata is ready, tell mp4box to start extracting sample information.
-    // This doesn't extract the actual data, just the metadata about each sample.
-    const vTrackId = info.videoTracks[0]?.id;
-    if (vTrackId != null)
-      mp4boxFile.setExtractionOptions(vTrackId, 'video', { nbSamples: 100 });
+      const vTrackId = info.videoTracks[0]?.id;
+      if (vTrackId != null) {
+        mp4boxFile.setExtractionOptions(vTrackId, 'video', { nbSamples: 100 });
+      }
 
-    const aTrackId = info.audioTracks[0]?.id;
-    if (aTrackId != null)
-      mp4boxFile.setExtractionOptions(aTrackId, 'audio', { nbSamples: 100 });
+      const aTrackId = info.audioTracks[0]?.id;
+      if (aTrackId != null) {
+        mp4boxFile.setExtractionOptions(aTrackId, 'audio', { nbSamples: 100 });
+      }
+      // Start the extraction process after setting options.
+      mp4boxFile.start();
+    };
 
-    // Start the extraction process.
-    mp4boxFile.start();
-  };
+    mp4boxFile.onSamples = (id, user, samples) => {
+      // Based on track_id, determine if it's video or audio
+      // This assumes a simple mapping; might need adjustment if track IDs are not standard
+      const track = mp4boxFile.getTrackById(id);
+      if (track.type === 'video') {
+        rawVideoSamples.push(...samples);
+      } else if (track.type === 'audio') {
+        rawAudioSamples.push(...samples);
+      }
+    };
 
-  // Set up the callback for when sample information has been extracted.
-  mp4boxFile.onSamples = onSamples;
+    mp4boxFile.onError = (e: any) => {
+      reject(new Error(`MP4Box parsing error: ${e}`));
+    };
 
-  // Start the chunked parsing process.
-  await parse();
+    // This inner function performs the actual chunked reading and parsing loop.
+    async function parse() {
+      try {
+        let cursor = 0; // The current position in the file.
+        const maxReadSize = 30 * 1024 * 1024; // Read in 30 MB chunks.
 
-  // This inner function performs the actual chunked reading and parsing loop.
-  async function parse() {
-    let cursor = 0; // The current position in the file.
-    const maxReadSize = 30 * 1024 * 1024; // Read in 30 MB chunks.
+        while (true) {
+          const data = (await reader.read(maxReadSize, {
+            at: cursor,
+          })) as MP4ArrayBuffer;
 
-    while (true) {
-      // Read a chunk of data from the file at the current cursor position.
-      const data = (await reader.read(maxReadSize, {
-        at: cursor,
-      })) as MP4ArrayBuffer;
+          if (data.byteLength === 0) {
+            // End of file
+            mp4boxFile.flush(); // Ensure all data is processed
+            mp4boxFile.stop();  // Finalize parsing
+            if (mp4Info == null) {
+              reject(new Error('MP4 parsing finished but mp4Info is null.'));
+              return;
+            }
+            resolve({
+              mp4Info,
+              rawVideoSamples,
+              rawAudioSamples,
+              mp4boxFile,
+            });
+            break;
+          }
 
-      // If we've reached the end of the file, break the loop.
-      if (data.byteLength === 0) break;
+          data.fileStart = cursor;
+          const nextPos = mp4boxFile.appendBuffer(data);
 
-      // Tell mp4box where this chunk is located in the original file.
-      // This is crucial for calculating the correct absolute byte offsets.
-      data.fileStart = cursor;
-
-      // Feed the chunk to the parser. mp4box processes it and returns the
-      // position in the file where the next read should start.
-      const nextPos = mp4boxFile.appendBuffer(data);
-
-      // If nextPos is null, it means mp4box has found all the necessary
-      // metadata ('moov') and doesn't need any more data. We can stop reading.
-      if (nextPos == null) break;
-
-      // Otherwise, update the cursor to the new position for the next loop iteration.
-      cursor = nextPos;
+          if (nextPos == null) {
+            // mp4box sometimes returns null when it has enough data for 'moov' but before EOF.
+            // We should continue reading until EOF to get all samples.
+            // The final resolve will happen when data.byteLength === 0.
+          }
+          cursor = nextPos ?? cursor + data.byteLength; // Advance cursor even if nextPos is null due to partial parse
+        }
+      } catch (err) {
+        reject(err);
+      }
     }
+    // Start the chunked parsing process.
+    parse();
+  });
+}
 
-    // Inform mp4box that we have reached the end of the file stream.
-    mp4boxFile.stop();
-  }
+export interface ParsedMP4Data {
+  mp4Info: MP4Info;
+  rawVideoSamples: MP4Sample[];
+  rawAudioSamples: MP4Sample[];
+  mp4boxFile: MP4File;
 }
